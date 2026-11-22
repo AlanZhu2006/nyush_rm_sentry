@@ -66,6 +66,10 @@ just flash dfu     # STM32 ROM DFU mode; verify first with dfu-util -l
 just flash         # auto-detect a supported transport
 ```
 
+For pyOCD, first run `just debug-setup` to install the STM32H7 CMSIS pack.
+The pyOCD target is `stm32h723vghx`; SEGGER uses `STM32H723VG`. The RTT
+transport translates the default device name when using the pyOCD backend.
+
 ## Troubleshooting
 
 - If J-Link cannot connect, close RTT dashboard/logger processes, reconnect USB,

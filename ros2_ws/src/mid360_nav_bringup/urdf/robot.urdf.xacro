@@ -6,8 +6,8 @@
   <xacro:arg name="lidar_x" default="0.0"/>
   <xacro:arg name="lidar_y" default="-0.11"/>
   <xacro:arg name="lidar_z" default="0.35"/>
-  <xacro:arg name="lidar_roll" default="0.0"/>
-  <xacro:arg name="lidar_pitch" default="0.0"/>
+  <xacro:arg name="lidar_roll" default="-0.01798"/>
+  <xacro:arg name="lidar_pitch" default="1.03795"/>
   <xacro:arg name="lidar_yaw" default="0.0"/>
 
   <link name="base_footprint"/>

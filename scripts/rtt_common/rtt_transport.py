@@ -134,7 +134,12 @@ class RTTTransport:
             options["connect_mode"] = self.config.connect_mode
 
         target_override = self.config.device if self.config.device else None
+        # SEGGER and CMSIS-Pack use different names for the same H723 device.
+        # The Keil pack exposes STM32H723VGHx; STM32H723VG is the J-Link name.
+        if target_override and target_override.lower() == "stm32h723vg":
+            target_override = "stm32h723vghx"
         session = ConnectHelper.session_with_chosen_probe(
+            blocking=False,
             unique_id=self.config.serial,
             target_override=target_override,
             options=options,
@@ -177,6 +182,9 @@ class RTTTransport:
         link = pylink.JLink()
 
         serial_int: Optional[int] = None
+        emulators = link.connected_emulators()
+        if not emulators:
+            raise RuntimeError("No J-Link probe found. Check USB connection and power.")
         if self.config.serial:
             serial_text = self.config.serial
             if ":" in serial_text:
@@ -190,7 +198,6 @@ class RTTTransport:
         # can raise a misspelled exception name and break auto fallback after a
         # pyOCD attempt. If exactly one emulator is present, open it explicitly.
         if serial_int is None:
-            emulators = link.connected_emulators()
             if len(emulators) == 1:
                 serial_int = int(emulators[0].SerialNumber)
             elif len(emulators) > 1:

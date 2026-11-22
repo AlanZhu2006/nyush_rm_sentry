@@ -24,7 +24,6 @@ static DJIMotorInstance *friction_l, *friction_r, *loader; // 拨盘电机
 // static servo_instance *lid; 需要增加弹舱盖
 
 static Publisher_t *shoot_pub;
-static Shoot_Ctrl_Cmd_s shoot_cmd_recv; // 来自cmd的发射控制信息
 static Subscriber_t *shoot_sub;
 static Shoot_Upload_Data_s shoot_feedback_data; // 来自cmd的发射控制信息
 
@@ -126,7 +125,12 @@ void ShootTask()
 #if DISABLE_SHOOT_MOTORS
     return;
 #endif
-    // 从cmd获取控制数据
+    // An empty command queue leaves all shooter motors stopped.
+    Shoot_Ctrl_Cmd_s shoot_cmd_recv = {
+        .shoot_mode = SHOOT_OFF,
+        .load_mode = LOAD_STOP,
+        .friction_mode = FRICTION_OFF,
+    };
     SubGetMessage(shoot_sub, &shoot_cmd_recv);
 
     // 对shoot mode等于SHOOT_STOP的情况特殊处理,直接停止所有电机(紧急停止)

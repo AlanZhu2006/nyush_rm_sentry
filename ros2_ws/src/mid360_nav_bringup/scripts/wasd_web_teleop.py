@@ -16,13 +16,21 @@ from typing import Any
 from urllib.parse import parse_qs, quote, urlparse
 
 from ament_index_python.packages import get_package_share_directory
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import Twist, Vector3
 import rclpy
 from rclpy.node import Node
 from rclpy.signals import SignalHandlerOptions
 
 
-ALLOWED_KEYS = frozenset({"w", "a", "s", "d", "q", "e"})
+CHASSIS_KEYS = frozenset({"w", "a", "s", "d", "q", "e"})
+GIMBAL_KEYS = frozenset({"i", "j", "k", "l", "u", "o"})
+ALLOWED_KEYS = CHASSIS_KEYS | GIMBAL_KEYS
+GIMBAL_MODES = frozenset({"manual", "cruise", "scan"})
+SMALL_YAW_RATE_RAD_S = 0.25
+PITCH_RATE_RAD_S = 0.18
+BIG_YAW_RATE_RAD_S = 0.15
+SCAN_PITCH_RATE_RAD_S = 0.09
+SCAN_PERIOD_S = 6.0
 MAX_REQUEST_BODY = 4096
 ZERO_BURST_FRAMES = 4
 
@@ -37,6 +45,8 @@ class SharedControlState:
         self._last_sequence = -1
         self._last_seen = 0.0
         self._armed = False
+        self._gimbal_armed = False
+        self._gimbal_mode = "manual"
         self._keys: set[str] = set()
         self._speed_scale = 1.0
 
@@ -53,6 +63,8 @@ class SharedControlState:
             self._last_sequence = -1
             self._last_seen = time.monotonic()
             self._armed = False
+            self._gimbal_armed = False
+            self._gimbal_mode = "manual"
             self._keys.clear()
             return self._snapshot_locked(time.monotonic())
 
@@ -63,12 +75,18 @@ class SharedControlState:
         armed: Any,
         keys: Any,
         speed_scale: Any,
+        gimbal_armed: Any = False,
+        gimbal_mode: Any = "manual",
     ) -> tuple[bool, str, dict[str, Any]]:
         client_id = self._validate_client(client)
-        if not isinstance(sequence, int) or sequence < 0:
+        if type(sequence) is not int or sequence < 0:
             raise ValueError("sequence must be a non-negative integer")
         if not isinstance(armed, bool):
             raise ValueError("armed must be a boolean")
+        if not isinstance(gimbal_armed, bool):
+            raise ValueError("gimbal_armed must be a boolean")
+        if not isinstance(gimbal_mode, str) or gimbal_mode not in GIMBAL_MODES:
+            raise ValueError("gimbal_mode must be manual, cruise, or scan")
         if not isinstance(keys, list) or any(not isinstance(key, str) for key in keys):
             raise ValueError("keys must be a string array")
         requested_keys = {key.lower() for key in keys}
@@ -78,6 +96,8 @@ class SharedControlState:
             requested_scale = float(speed_scale)
         except (TypeError, ValueError) as error:
             raise ValueError("speed_scale must be numeric") from error
+        if not math.isfinite(requested_scale):
+            raise ValueError("speed_scale must be finite")
         requested_scale = max(0.2, min(1.0, requested_scale))
 
         now = time.monotonic()
@@ -91,7 +111,12 @@ class SharedControlState:
             self._last_sequence = sequence
             self._last_seen = now
             self._armed = armed
-            self._keys = requested_keys if armed else set()
+            self._gimbal_armed = gimbal_armed
+            self._gimbal_mode = gimbal_mode if self._gimbal_armed else "manual"
+            self._keys = (
+                (requested_keys & CHASSIS_KEYS if armed else set())
+                | (requested_keys & GIMBAL_KEYS if self._gimbal_armed else set())
+            )
             self._speed_scale = requested_scale
             return True, "updated", self._snapshot_locked(now)
 
@@ -103,6 +128,8 @@ class SharedControlState:
                 self._last_sequence = -1
                 self._last_seen = 0.0
                 self._armed = False
+                self._gimbal_armed = False
+                self._gimbal_mode = "manual"
                 self._keys.clear()
             return self._snapshot_locked(time.monotonic())
 
@@ -113,11 +140,13 @@ class SharedControlState:
             return self._snapshot_locked(now)
 
     def _expire_locked(self, now: float) -> None:
-        if self._armed and now - self._last_seen > self._watchdog_s:
+        if (self._armed or self._gimbal_armed) and now - self._last_seen > self._watchdog_s:
             self._active_client = None
             self._last_sequence = -1
             self._last_seen = 0.0
             self._armed = False
+            self._gimbal_armed = False
+            self._gimbal_mode = "manual"
             self._keys.clear()
 
     def _snapshot_locked(self, now: float) -> dict[str, Any]:
@@ -125,6 +154,8 @@ class SharedControlState:
         return {
             "active_client": self._active_client,
             "armed": self._armed,
+            "gimbal_armed": self._gimbal_armed,
+            "gimbal_mode": self._gimbal_mode,
             "keys": sorted(self._keys),
             "speed_scale": self._speed_scale,
             "heartbeat_age_s": age_s,
@@ -146,10 +177,15 @@ class BrowserTeleop(Node):
         super().__init__("wasd_web_teleop")
         self.control_state = SharedControlState(watchdog_s)
         self._publisher = self.create_publisher(Twist, topic, 10)
+        self._gimbal_publisher = self.create_publisher(Vector3, "/gimbal/cmd_vel_preview", 10)
         self._linear_speed = linear_speed
         self._angular_speed = angular_speed
         self._was_armed = False
         self._zero_frames_remaining = 0
+        self._gimbal_was_armed = False
+        self._gimbal_zero_frames_remaining = 0
+        self._scan_started_at = time.monotonic()
+        self._last_gimbal_mode = "manual"
         self.create_timer(1.0 / publish_rate_hz, self._publish_tick)
         self.get_logger().info(
             f"Browser teleop ready: topic={topic}, linear={linear_speed:.2f} m/s, "
@@ -161,6 +197,9 @@ class BrowserTeleop(Node):
         return {
             "linear_speed": self._linear_speed,
             "angular_speed": self._angular_speed,
+            "small_yaw_speed": SMALL_YAW_RATE_RAD_S,
+            "pitch_speed": PITCH_RATE_RAD_S,
+            "big_yaw_speed": BIG_YAW_RATE_RAD_S,
         }
 
     def _publish_tick(self) -> None:
@@ -168,6 +207,8 @@ class BrowserTeleop(Node):
         keys = set(snapshot["keys"])
         scale = float(snapshot["speed_scale"])
         armed = bool(snapshot["armed"])
+        gimbal_armed = bool(snapshot["gimbal_armed"])
+        gimbal_mode = str(snapshot["gimbal_mode"])
 
         vx_scale = float(("w" in keys) - ("s" in keys))
         vy_scale = float(("a" in keys) - ("d" in keys))
@@ -185,20 +226,46 @@ class BrowserTeleop(Node):
             self._publisher.publish(message)
             self._was_armed = True
             self._zero_frames_remaining = 0
-            return
+        else:
+            if self._was_armed:
+                self._zero_frames_remaining = ZERO_BURST_FRAMES
+                self._was_armed = False
+            if self._zero_frames_remaining > 0:
+                self._publisher.publish(Twist())
+                self._zero_frames_remaining -= 1
 
-        if self._was_armed:
-            self._zero_frames_remaining = ZERO_BURST_FRAMES
-            self._was_armed = False
-        if self._zero_frames_remaining > 0:
-            self._publisher.publish(Twist())
-            self._zero_frames_remaining -= 1
+        if gimbal_armed:
+            if gimbal_mode != self._last_gimbal_mode or not self._gimbal_was_armed:
+                self._scan_started_at = time.monotonic()
+            self._last_gimbal_mode = gimbal_mode
+            command = Vector3()
+            if gimbal_mode == "manual":
+                command.x = float(("j" in keys) - ("l" in keys)) * SMALL_YAW_RATE_RAD_S * scale
+                command.y = float(("i" in keys) - ("k" in keys)) * PITCH_RATE_RAD_S * scale
+                command.z = float(("u" in keys) - ("o" in keys)) * BIG_YAW_RATE_RAD_S * scale
+            elif gimbal_mode == "cruise":
+                command.z = BIG_YAW_RATE_RAD_S * scale
+            elif gimbal_mode == "scan":
+                command.z = BIG_YAW_RATE_RAD_S * scale
+                phase = (time.monotonic() - self._scan_started_at) * (2.0 * math.pi / SCAN_PERIOD_S)
+                command.y = SCAN_PITCH_RATE_RAD_S * math.sin(phase) * scale
+            self._gimbal_publisher.publish(command)
+            self._gimbal_was_armed = True
+            self._gimbal_zero_frames_remaining = 0
+        else:
+            if self._gimbal_was_armed:
+                self._gimbal_zero_frames_remaining = ZERO_BURST_FRAMES
+                self._gimbal_was_armed = False
+            if self._gimbal_zero_frames_remaining > 0:
+                self._gimbal_publisher.publish(Vector3())
+                self._gimbal_zero_frames_remaining -= 1
 
     def publish_shutdown_stop(self) -> None:
         if not rclpy.ok():
             return
         for _ in range(ZERO_BURST_FRAMES):
             self._publisher.publish(Twist())
+            self._gimbal_publisher.publish(Vector3())
             time.sleep(0.02)
 
 
@@ -320,6 +387,8 @@ class TeleopRequestHandler(BaseHTTPRequestHandler):
                     payload.get("armed"),
                     payload.get("keys"),
                     payload.get("speed_scale", 1.0),
+                    payload.get("gimbal_armed", False),
+                    payload.get("gimbal_mode", "manual"),
                 )
                 status = 200 if accepted else 409
                 self._send_json(status, {"ok": accepted, "message": message, "state": state})

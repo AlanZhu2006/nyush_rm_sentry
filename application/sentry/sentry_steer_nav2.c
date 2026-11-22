@@ -1,6 +1,8 @@
 #include "sentry_steer_nav2.h"
+#include "sentry_vision.h"
 
 #include "FreeRTOS.h"
+#include "bsp_can.h"
 #include "bsp_dwt.h"
 #include "bsp_log.h"
 #include "bsp_usb.h"
@@ -13,6 +15,7 @@
 
 #include <math.h>
 #include <stdlib.h>
+#include <string.h>
 
 #if defined(ROBOT_TYPE_sentry_swerve) && SENTRY_STEER_NAV2_CONTROL
 
@@ -82,8 +85,15 @@ static float target_total_angle_deg[SENTRY_STEER_NAV2_MOTOR_COUNT];
 static float drive_target_rpm[SENTRY_STEER_NAV2_MOTOR_COUNT];
 static float applied_drive_target_rpm[SENTRY_STEER_NAV2_MOTOR_COUNT];
 static uint8_t *usb_rx_buffer;
-static uint8_t rx_frame[NAV2_COMMAND_FRAME_SIZE];
-static uint8_t rx_frame_index;
+static SentryVisionStream_s vision_stream;
+static SentryVisionState_s vision_state;
+static SentryVisionFeedback_s vision_feedback;
+/* RX ISR owns mailbox writes. Task copies the latest complete frame atomically. */
+static uint8_t vision_rx_command[SENTRY_VISION_COMMAND_SIZE];
+static volatile uint16_t vision_rx_sequence;
+static uint16_t vision_handled_sequence;
+static uint16_t vision_handled_invalid;
+static volatile uint32_t vision_rx_ms;
 static volatile int16_t rx_vx_mm_s;
 static volatile int16_t rx_vy_mm_s;
 static volatile int16_t rx_wz_mrad_s;
@@ -530,33 +540,62 @@ static void DecodeCommandFrame(const uint8_t *frame)
     rx_sequence = (uint16_t)(rx_sequence + 1u);
 }
 
+static void MixedCommandFrame(void *context, const uint8_t *frame, size_t length)
+{
+    (void)context;
+    if (length == NAV2_COMMAND_FRAME_SIZE)
+        DecodeCommandFrame(frame);
+    else
+    {
+        memcpy(vision_rx_command, frame, SENTRY_VISION_COMMAND_SIZE);
+        vision_rx_ms = (uint32_t)(xTaskGetTickCountFromISR() * portTICK_PERIOD_MS);
+        ++vision_rx_sequence;
+    }
+}
+
 static void Nav2UsbRxCallback(uint16_t length)
 {
-    for (uint16_t i = 0u; i < length; ++i)
+    SentryVisionStreamPush(&vision_stream, usb_rx_buffer, length, MixedCommandFrame, NULL);
+}
+
+static void UpdateVisionLink(uint32_t now_ms, uint8_t manual)
+{
+    SentryVisionFeedback_s sample = {0};
+    if (!SentryVisionReadFeedback(&sample))
+        memset(&sample, 0, sizeof(sample));
+    /* This configuration registers chassis motors only. */
+    sample.capabilities &= (SENTRY_VISION_ATTITUDE | SENTRY_VISION_BULLET_SPEED |
+                            SENTRY_VISION_BULLET_COUNT);
+    vision_feedback = sample;
+    uint8_t frame[SENTRY_VISION_COMMAND_SIZE];
+    uint32_t received_ms = 0u;
+    uint8_t received = 0u;
+    uint16_t invalid_count;
+    taskENTER_CRITICAL();
+    invalid_count = vision_stream.invalid_sp_count;
+    if (vision_handled_sequence != vision_rx_sequence)
     {
-        const uint8_t byte = usb_rx_buffer[i];
-
-        if (rx_frame_index == 0u)
-        {
-            if (byte == NAV2_PROTOCOL_MAGIC_0)
-                rx_frame[rx_frame_index++] = byte;
-            continue;
-        }
-
-        if (rx_frame_index == 1u && byte != NAV2_PROTOCOL_MAGIC_1)
-        {
-            rx_frame_index = byte == NAV2_PROTOCOL_MAGIC_0 ? 1u : 0u;
-            rx_frame[0] = byte;
-            continue;
-        }
-
-        rx_frame[rx_frame_index++] = byte;
-        if (rx_frame_index == NAV2_COMMAND_FRAME_SIZE)
-        {
-            DecodeCommandFrame(rx_frame);
-            rx_frame_index = 0u;
-        }
+        vision_handled_sequence = vision_rx_sequence;
+        memcpy(frame, vision_rx_command, sizeof(frame));
+        received_ms = vision_rx_ms;
+        received = 1u;
     }
+    taskEXIT_CRITICAL();
+    if (invalid_count != vision_handled_invalid)
+    {
+        vision_state.rejected_count += (uint16_t)(invalid_count - vision_handled_invalid);
+        vision_handled_invalid = invalid_count;
+        vision_state.seen = 0u;
+        vision_state.flags |= SENTRY_VISION_REJECTED;
+        /* A bad frame in this RX batch revokes even an adjacent valid command. */
+        received = 0u;
+    }
+    if (received)
+    {
+        SentryVisionAccept(&vision_state, frame, sizeof(frame), now_ms, &vision_feedback);
+        vision_state.command_ms = received_ms;
+    }
+    SentryVisionUpdate(&vision_state, &vision_feedback, now_ms, manual);
 }
 
 static void Nav2UsbTxCallback(uint16_t length)
@@ -651,9 +690,21 @@ static void CalculateSwerveTargets(float vx_mm_s, float vy_mm_s, float wz_mrad_s
 
     for (uint8_t i = 0u; i < SENTRY_STEER_NAV2_MOTOR_COUNT; ++i)
     {
-        const float module_vx = vx_mm_s - wz_rad_s * module_y_mm[i];
+        float module_vx = vx_mm_s - wz_rad_s * module_y_mm[i];
         const float module_vy_left = vy_mm_s + wz_rad_s * module_x_mm[i];
-        const float module_vy_right = -module_vy_left;
+        float module_vy_right = -module_vy_left;
+
+        /* Recaptured zeros are ~90 deg from the previous set, so the same
+         * ICR diamond is scheme 2 in the chassis. Rotate yaw-only velocity
+         * +90 deg to restore the previous scheme-1 小陀螺. W/A/S/D keep
+         * the new mechanical forward. */
+        if (translation_speed < CHASSIS_STEER_NAV2_STOP_TRANSLATION_MM_S)
+        {
+            const float vx_rot = -module_vy_right;
+            const float vy_rot = module_vx;
+            module_vx = vx_rot;
+            module_vy_right = vy_rot;
+        }
 
         wheel_speed_mm_s[i] = sqrtf(module_vx * module_vx +
                                     module_vy_right * module_vy_right);
@@ -829,7 +880,7 @@ static void RecordTelemetryRecovery(uint32_t now_ms, const char *reason)
 
 static void SendTelemetry(uint32_t now_ms, uint8_t command_fresh)
 {
-    uint8_t frame[NAV2_TELEMETRY_FRAME_SIZE] = {0};
+    static uint8_t frame[NAV2_TELEMETRY_FRAME_SIZE + SENTRY_VISION_TELEMETRY_SIZE + SENTRY_VISION_STATUS_SIZE];
     uint8_t status = 0u;
     uint8_t transmit_result;
 
@@ -844,11 +895,15 @@ static void SendTelemetry(uint32_t now_ms, uint8_t command_fresh)
             return;
 
         const uint8_t abort_result = USBAbortTransmit();
+        if (abort_result != USBD_OK)
+            return; /* Storage remains owned by the asynchronous transmitter. */
         telemetry_tx_pending = 0u;
         telemetry_busy_started_ms = 0u;
         if (abort_result == USBD_OK)
             RecordTelemetryRecovery(now_ms, "stalled");
     }
+
+    memset(frame, 0, sizeof(frame));
 
     if (sentry_steer_nav2_state.control_enabled)
         status |= NAV2_STATUS_CONTROL_ENABLED;
@@ -868,10 +923,14 @@ static void SendTelemetry(uint32_t now_ms, uint8_t command_fresh)
     frame[26] = status;
     WriteU16Le(&frame[27], ProtocolCrc16(frame, NAV2_TELEMETRY_FRAME_SIZE - 2u));
 
+    SentryVisionEncodeTelemetry(&vision_state, &vision_feedback, &frame[NAV2_TELEMETRY_FRAME_SIZE]);
+    SentryVisionEncodeStatus(&vision_state, &vision_feedback,
+                             &frame[NAV2_TELEMETRY_FRAME_SIZE + SENTRY_VISION_TELEMETRY_SIZE]);
+
     /* Set the flag before submission so an immediate completion interrupt
        cannot race with the task and leave a false pending state behind. */
     telemetry_tx_pending = 1u;
-    transmit_result = USBTransmit(frame, NAV2_TELEMETRY_FRAME_SIZE);
+    transmit_result = USBTransmit(frame, sizeof(frame));
     if (transmit_result == USBD_OK)
     {
         telemetry_tx_started_ms = now_ms;
@@ -933,6 +992,20 @@ static void LogNav2State(uint32_t now_ms, uint8_t command_fresh)
             LogicalDriveMotorRpm(STEER_NAV2_RF),
             LogicalDriveMotorRpm(STEER_NAV2_LR),
             LogicalDriveMotorRpm(STEER_NAV2_RR));
+
+    {
+        CAN_Debug_Info_s can1_debug;
+        CAN_Debug_Info_s can2_debug;
+        CANGetDebugInfo(&hfdcan1, &can1_debug);
+        CANGetDebugInfo(&hfdcan2, &can2_debug);
+        LOGINFO("[steer-nav2] fdcan1 PSR=0x%08lx ECR=0x%08lx fdcan2 PSR=0x%08lx ECR=0x%08lx online=0x%x/0x%x",
+                (unsigned long)can1_debug.msr,
+                (unsigned long)can1_debug.esr,
+                (unsigned long)can2_debug.msr,
+                (unsigned long)can2_debug.esr,
+                sentry_steer_nav2_state.steer_online_bitmap,
+                sentry_steer_nav2_state.drive_online_bitmap);
+    }
 }
 
 void SentrySteerNav2Init(void)
@@ -1028,13 +1101,18 @@ void SentrySteerNav2Init(void)
 
 void SentrySteerNav2Task(void)
 {
-    const uint32_t now_ms = (uint32_t)DWT_GetTimeline_ms();
-    const uint8_t steer_online = MotorOnlineBitmap(steer_motors);
-    const uint8_t drive_online = MotorOnlineBitmap(drive_motors);
+    const uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
     uint8_t command_fresh;
+    uint8_t steer_online;
+    uint8_t drive_online;
     float vx_mm_s;
     float vy_mm_s;
     float wz_mrad_s;
+
+    UpdateVisionLink(now_ms, 0u);
+    CANPollRecoverAll();
+    steer_online = MotorOnlineBitmap(steer_motors);
+    drive_online = MotorOnlineBitmap(drive_motors);
 
     if (handled_rx_sequence != rx_sequence)
     {

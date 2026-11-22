@@ -114,8 +114,8 @@ class FastlioOdomAdapter(Node):
         self.declare_parameter("base_to_lidar_x", 0.0)
         self.declare_parameter("base_to_lidar_y", -0.11)
         self.declare_parameter("base_to_lidar_z", 0.35)
-        self.declare_parameter("base_to_lidar_roll", 0.0)
-        self.declare_parameter("base_to_lidar_pitch", 0.0)
+        self.declare_parameter("base_to_lidar_roll", -0.01798)
+        self.declare_parameter("base_to_lidar_pitch", 1.03795)
         self.declare_parameter("base_to_lidar_yaw", 0.0)
         # FAST-LIO mid360.yaml defines the LiDAR pose in the IMU body frame.
         self.declare_parameter("body_to_lidar_x", -0.011)

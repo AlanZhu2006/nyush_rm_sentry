@@ -107,9 +107,16 @@ You can still append extra options when needed, for example:
 just logger-cli --serial 69655005 --refresh-ms 80
 ```
 
-By default, backend selection is automatic (`--backend auto`): prefer pyOCD and
-fall back to direct `pylink` RTT mode when needed. RTT telemetry channel is also
-auto-detected unless `--no-auto-channel` is provided.
+By default, backend selection is automatic (`--backend auto`): use direct
+`pylink` when a J-Link is detected; otherwise try pyOCD and then J-Link.
+If no debug probe is available, the tools report an error instead of waiting
+indefinitely. RTT telemetry channel is also auto-detected unless
+`--no-auto-channel` is provided.
+
+On Linux, the `just` Python launcher also discovers SEGGER libraries installed
+under `~/.local/opt/JLink_Linux_*`. This lets `just logger` use the same SDK as
+the locally installed `JLinkExe`. For an SDK installed elsewhere, set
+`JLINK_LIB_DIR` to the directory containing `libjlinkarm.so`.
 
 Useful options:
 

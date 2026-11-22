@@ -2,6 +2,8 @@
 """Bridge ROS 2 body velocity commands and the sentry swerve controller over USB CDC."""
 
 import math
+from pathlib import Path
+import sys
 import struct
 import time
 
@@ -11,6 +13,8 @@ from nav_msgs.msg import Odometry
 from rclpy.node import Node
 import serial
 from serial.tools import list_ports
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from sentry_vision_transport import SharedVisionTransport, RELEASE
 
 
 MAGIC = b"\xa5\x5a"
@@ -30,7 +34,7 @@ WHEEL_RADIUS_M = 0.060
 WHEEL_REDUCTION_RATIO = 19.0
 WHEEL_BASE_M = 0.350
 TRACK_WIDTH_M = 0.300
-STEER_ZERO_ECD = (5484, 702, 6106, 3407)
+STEER_ZERO_ECD = (6141, 6814, 4081, 1358)
 STEER_DIRECTION_SIGN = (1, 1, 1, 1)
 DRIVE_FEEDBACK_SIGN = (-1, 1, -1, 1)
 MODULE_X_M = (
@@ -89,6 +93,7 @@ class SentryNav2Bridge(Node):
     def __init__(self) -> None:
         super().__init__("sentry_nav2_bridge")
         self.declare_parameter("port", "")
+        self.declare_parameter("vision_pty", "/tmp/nyush-rm-sentry-vision")
         self.declare_parameter("command_topic", "/cmd_vel")
         self.declare_parameter("odom_topic", "/wheel/odom")
         self.declare_parameter("command_rate_hz", 20.0)
@@ -119,6 +124,7 @@ class SentryNav2Bridge(Node):
         self._next_reconnect_monotonic = 0.0
         self._last_connection_warning = 0.0
         self._rx_buffer = bytearray()
+        self._vision = SharedVisionTransport(str(self.get_parameter("vision_pty").value))
         self._rx_bytes_total = 0
         self._valid_frame_count = 0
         self._crc_error_count = 0
@@ -157,7 +163,7 @@ class SentryNav2Bridge(Node):
                 port=port,
                 baudrate=115200,
                 timeout=0,
-                write_timeout=0.05,
+                write_timeout=0,
                 exclusive=True,
             )
         except (RuntimeError, OSError, serial.SerialException) as error:
@@ -167,6 +173,12 @@ class SentryNav2Bridge(Node):
                 self._last_connection_warning = now
             return False
 
+        try:
+            self._vision.reset(now)
+        except OSError as error:
+            connection.close()
+            raise RuntimeError(f"Cannot create vision PTY: {error}") from error
+        self._last_twist_monotonic = None
         self._serial = connection
         self._serial_port = port
         self._connected_monotonic = now
@@ -178,6 +190,11 @@ class SentryNav2Bridge(Node):
         return True
 
     def _disconnect_serial(self, reason: str) -> None:
+        self._vision.close()
+        self._vision.tx.clear()
+        self._vision.output.clear()
+        self._vision.active = False
+        self._last_twist_monotonic = None
         connection = self._serial
         port = self._serial_port
         self._serial = None
@@ -204,6 +221,9 @@ class SentryNav2Bridge(Node):
         self._last_twist_monotonic = time.monotonic()
 
     def _send_command(self) -> None:
+        if not hasattr(self, "_vision"):
+            # Keep offline diagnostic callers independent of a real PTY.
+            self._vision = SharedVisionTransport(None)
         if self._serial is None and not self._connect_serial():
             return
 
@@ -217,6 +237,9 @@ class SentryNav2Bridge(Node):
         vx = float(self._latest_twist.linear.x) if enabled else 0.0
         vy = float(self._latest_twist.linear.y) if enabled else 0.0
         wz = float(self._latest_twist.angular.z) if enabled else 0.0
+        if not all(math.isfinite(value) for value in (vx, vy, wz)):
+            vx = vy = wz = 0.0
+            enabled = False
         max_translation = float(self.get_parameter("max_translation_m_s").value)
         max_angular = float(self.get_parameter("max_angular_rad_s").value)
         translation = math.hypot(vx, vy)
@@ -242,61 +265,38 @@ class SentryNav2Bridge(Node):
         if connection is None:
             return
         try:
-            written = connection.write(frame)
-            if written != len(frame):
-                raise serial.SerialTimeoutException(
-                    f"short write: sent {written} of {len(frame)} bytes"
-                )
-        except (OSError, serial.SerialException) as error:
+            self._vision.tx.put(frame, now, "nav")
+            for _ in range(4):
+                self._vision.tx.flush(connection.write, now)
+        except (OSError, serial.SerialException, BufferError, TimeoutError) as error:
             self._disconnect_serial(f"command write failed: {error}")
 
     def _read_telemetry(self) -> None:
+        if not hasattr(self, "_vision"):
+            # Keep offline diagnostic callers independent of a real PTY.
+            self._vision = SharedVisionTransport(None)
         connection = self._serial
         if connection is None:
             return
+        now = time.monotonic()
         try:
-            waiting = connection.in_waiting
-            if waiting:
-                received = connection.read(waiting)
-                self._rx_buffer.extend(received)
-                self._rx_bytes_total += len(received)
-        except (OSError, serial.SerialException) as error:
-            self._disconnect_serial(f"telemetry read failed: {error}")
+            self._vision.poll(now)
+            waiting = min(connection.in_waiting, 4096)
+            received = connection.read(waiting) if waiting else b""
+            self._rx_bytes_total += len(received)
+            frames = self._vision.feed_usb(received, now)
+            for _ in range(4):
+                self._vision.tx.flush(connection.write, now)
+        except (OSError, serial.SerialException, BufferError, TimeoutError) as error:
+            self._disconnect_serial(f"shared serial transport failed: {error}")
             return
-
-        while len(self._rx_buffer) >= TELEMETRY_FRAME_SIZE:
-            magic_index = self._rx_buffer.find(MAGIC)
-            if magic_index < 0:
-                keep_prefix = self._rx_buffer[-1:] == MAGIC[:1]
-                discarded = len(self._rx_buffer) - (1 if keep_prefix else 0)
-                self._discarded_byte_count += discarded
-                if keep_prefix:
-                    self._rx_buffer[:] = self._rx_buffer[-1:]
-                else:
-                    self._rx_buffer.clear()
-                return
-            if magic_index:
-                self._discarded_byte_count += magic_index
-                del self._rx_buffer[:magic_index]
-            if len(self._rx_buffer) < TELEMETRY_FRAME_SIZE:
-                return
-
-            frame = bytes(self._rx_buffer[:TELEMETRY_FRAME_SIZE])
+        self._crc_error_count = self._vision.parser.crc_errors
+        self._discarded_byte_count = self._vision.parser.discarded
+        for kind, frame in frames:
             body = frame[:-CRC.size]
-            received_crc = CRC.unpack(frame[-CRC.size:])[0]
-            if crc16_ccitt(body) != received_crc:
-                self._crc_error_count += 1
-                self._discarded_byte_count += 1
-                del self._rx_buffer[0]
+            if kind != "nav":
                 continue
-
             fields = TELEMETRY_BODY.unpack(body)
-            if fields[0] != MAGIC or fields[1] != PROTOCOL_VERSION or fields[2] != TELEMETRY_TYPE:
-                self._discarded_byte_count += 1
-                del self._rx_buffer[0]
-                continue
-
-            del self._rx_buffer[:TELEMETRY_FRAME_SIZE]
             self._valid_frame_count += 1
             mcu_time_ms = int(fields[4])
             steer_ecd = tuple(int(value) for value in fields[5:9])
@@ -422,6 +422,7 @@ class SentryNav2Bridge(Node):
             )
 
     def destroy_node(self) -> bool:
+        self._vision.close()
         connection = self._serial
         try:
             if connection is not None:
@@ -436,11 +437,22 @@ class SentryNav2Bridge(Node):
                     0,
                 )
                 zero_frame = zero_body + CRC.pack(crc16_ccitt(zero_body))
-                for _ in range(3):
-                    connection.write(zero_frame)
-                connection.close()
-        except (OSError, serial.SerialException):
+                now = time.monotonic()
+                self._vision.tx.cancel_unsent()
+                self._vision.tx.put(RELEASE, now, "vision")
+                self._vision.tx.put(zero_frame, now, "nav")
+                for _ in range(128):
+                    if not self._vision.tx.pending or time.monotonic() - now > .05:
+                        break
+                    self._vision.tx.flush(connection.write, time.monotonic())
+        except (OSError, serial.SerialException, BufferError, TimeoutError):
             pass
+        finally:
+            if connection is not None:
+                try:
+                    connection.close()
+                except (OSError, serial.SerialException):
+                    pass
         self._serial = None
         return super().destroy_node()
 
@@ -451,7 +463,7 @@ def main(args: list[str] | None = None) -> None:
     try:
         node = SentryNav2Bridge()
         rclpy.spin(node)
-    except (RuntimeError, serial.SerialException, ValueError) as error:
+    except (RuntimeError, OSError, serial.SerialException, ValueError) as error:
         if node is not None:
             node.get_logger().fatal(str(error))
         else:

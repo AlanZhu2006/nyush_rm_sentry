@@ -38,13 +38,22 @@ configure_rviz_display() {
     return
   fi
 
+  # Prefer the NUC TigerVNC desktop (:2). Do not keep an SSH forwarded DISPLAY
+  # such as localhost:10.0 — RViz would abort there instead of appearing in VNC.
+  if [ -S /tmp/.X11-unix/X2 ] && [ -r "${HOME}/.vnc/sentry-Xauthority" ]; then
+    export DISPLAY=:2
+    export XAUTHORITY="${HOME}/.vnc/sentry-Xauthority"
+    return
+  fi
+
+  if [ -S /tmp/.X11-unix/X1 ]; then
+    export DISPLAY=:1
+    export XAUTHORITY="${NAV_RVIZ_XAUTHORITY:-${HOME}/.Xauthority}"
+    return
+  fi
+
   if [ -n "${SSH_CONNECTION:-}" ]; then
-    if [ -S /tmp/.X11-unix/X1 ]; then
-      export DISPLAY=:1
-      export XAUTHORITY="${HOME}/.Xauthority"
-    else
-      echo "Warning: SSH detected but VNC display :1 is unavailable; RViz may not start." >&2
-    fi
+    echo "Warning: SSH detected but no VNC display (:2 or :1) is available; RViz may not start." >&2
   fi
 }
 

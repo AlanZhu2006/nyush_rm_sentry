@@ -25,22 +25,6 @@ static DaemonInstance *vision_daemon_instance;
 // ==================== SP协议辅助函数 ====================
 
 /**
- * @brief 在缓冲区中查找SP帧头
- * @param buffer 数据缓冲区
- * @param len 缓冲区长度
- * @return 帧头位置索引,未找到返回0xFF
- */
-static uint8_t FindSPHeader(uint8_t *buffer, size_t len)
-{
-    for (size_t i = 0; i < len - 1; i++)
-    {
-        if (buffer[i] == VISION_SP_HEADER_1 && buffer[i + 1] == VISION_SP_HEADER_2)
-            return i;
-    }
-    return 0xFF;
-}
-
-/**
  * @brief 填充云台到视觉的数据包姿态字段（统一坐标语义）
  * @note q 和 yaw/pitch 使用同一套 send_data 欧拉角定义，避免字段语义不一致
  */
@@ -61,7 +45,8 @@ static void FillGimbalToVisionAttitude(GimbalToVision_s *packet)
     memcpy(send_data.q, q_send, sizeof(float) * 4);
 
     // 协议发送坐标由 ctrl 坐标在边界处转换。
-    packet->yaw = send_data.yaw * VISION_DEG_TO_RAD;
+    /* Internal yaw remains multi-turn; the wire carries its principal phase. */
+    packet->yaw = remainderf(send_data.yaw * VISION_DEG_TO_RAD, 6.283185307f);
     packet->yaw_vel = yaw_ctrl_rad_s;
     packet->pitch = send_data.pitch * VISION_DEG_TO_RAD;
     packet->pitch_vel = pitch_ctrl_rad_s;
@@ -87,52 +72,22 @@ static uint8_t ValidateQuaternion(float q[4])
  * @param data VisionToGimbal数据包指针
  * @return 1=有效, 0=无效
  */
-static uint8_t ValidateVisionData(VisionToGimbal_s *data)
+static uint8_t ValidateVisionPayload(const VisionToGimbal_s *data)
 {
-    // 检查CRC
-    uint16_t calc_crc = crc_16((uint8_t *)data, sizeof(VisionToGimbal_s) - 2);
-    if (calc_crc != data->crc16)
-    {
-        LOGERROR("[vision] CRC error: calc=0x%04X, recv=0x%04X", calc_crc, data->crc16);
-        return 0;
-    }
-
-    // 检查模式范围
-    if (data->mode > 2)
-    {
-        LOGERROR("[vision] Invalid mode: %d", data->mode);
-        return 0;
-    }
-
-    // 检查角度范围 (±π)
-    if (fabsf(data->yaw) > 3.15f || fabsf(data->pitch) > 3.15f)
-    {
-        LOGERROR("[vision] Angle out of range: yaw=%.2f, pitch=%.2f", data->yaw, data->pitch);
-        return 0;
-    }
-
-    return 1;
+    return data && data->mode <= 2 &&
+           isfinite(data->yaw) && fabsf(data->yaw) <= 3.15f &&
+           isfinite(data->pitch) && fabsf(data->pitch) <= 3.15f &&
+           isfinite(data->yaw_vel) && fabsf(data->yaw_vel) <= 100.0f &&
+           isfinite(data->pitch_vel) && fabsf(data->pitch_vel) <= 100.0f &&
+           isfinite(data->yaw_acc) && fabsf(data->yaw_acc) <= 1000.0f &&
+           isfinite(data->pitch_acc) && fabsf(data->pitch_acc) <= 1000.0f;
 }
 
-/**
- * @brief 快速校验视觉包（静默模式，用于流式重同步）
- */
 static uint8_t ValidateVisionDataFast(const VisionToGimbal_s *data)
 {
-    if (!data)
-        return 0;
-
-    uint16_t calc_crc = crc_16((uint8_t *)data, sizeof(VisionToGimbal_s) - 2);
-    if (calc_crc != data->crc16)
-        return 0;
-
-    if (data->mode > 2)
-        return 0;
-
-    if (fabsf(data->yaw) > 3.15f || fabsf(data->pitch) > 3.15f)
-        return 0;
-
-    return 1;
+    return ValidateVisionPayload(data) &&
+           data->head[0] == VISION_SP_HEADER_1 && data->head[1] == VISION_SP_HEADER_2 &&
+           crc_16((uint8_t *)data, sizeof(*data) - 2u) == data->crc16;
 }
 
 /**
@@ -175,6 +130,42 @@ static void ApplyVisionPacket(const VisionToGimbal_s *packet)
     recv_data.pitch = packet->pitch * VISION_RAD_TO_DEG;
     recv_data.target_type = NO_TARGET_NUM; // 视觉端未提供此数据
     recv_data.new_data = 1;
+}
+
+/* UART idle events and USB read boundaries carry arbitrary stream fragments. */
+static void DecodeVisionBytes(const uint8_t *data, size_t length)
+{
+    static uint8_t stream[VISION_RECV_SIZE];
+    static size_t used;
+    while (length--)
+    {
+        stream[used++] = *data++;
+        while (used >= 2u)
+        {
+            if (stream[0] != VISION_SP_HEADER_1 || stream[1] != VISION_SP_HEADER_2)
+            {
+                memmove(stream, stream + 1u, --used);
+                continue;
+            }
+            if (used < VISION_RECV_SIZE)
+                break;
+            VisionToGimbal_s packet;
+            memcpy(&packet, stream, sizeof(packet));
+            if (ValidateVisionDataFast(&packet))
+            {
+                ApplyVisionPacket(&packet);
+                DaemonReload(vision_daemon_instance);
+                used = 0u;
+            }
+            else
+            {
+                /* Invalid traffic revokes authority immediately. */
+                VisionToGimbal_s release = {0};
+                ApplyVisionPacket(&release);
+                memmove(stream, stream + 1u, --used);
+            }
+        }
+    }
 }
 
 static uint8_t BulletSpeedToCode(Bullet_Speed_e speed)
@@ -308,29 +299,7 @@ static USARTInstance *vision_usart_instance;
  */
 static void DecodeVision()
 {
-    uint8_t header_pos = FindSPHeader(vision_usart_instance->recv_buff, VISION_RECV_SIZE);
-    if (header_pos == 0xFF)
-    {
-        LOGERROR("[vision] SP header not found");
-        return;
-    }
-
-    if (header_pos != 0)
-    {
-        LOGERROR("[vision] Misaligned SP frame: header_pos=%u", header_pos);
-        return;
-    }
-
-    VisionToGimbal_s *packet = (VisionToGimbal_s *)(vision_usart_instance->recv_buff + header_pos);
-
-    // 验证数据有效性
-    if (!ValidateVisionData(packet))
-    {
-        return;
-    }
-
-    DaemonReload(vision_daemon_instance); // 仅在有效包时喂狗
-    ApplyVisionPacket(packet);
+    DecodeVisionBytes(vision_usart_instance->recv_buff, vision_usart_instance->recv_len);
 }
 
 Vision_Recv_s *VisionInit(UART_HandleTypeDef *_handle)
@@ -397,95 +366,7 @@ static uint8_t *vis_recv_buff;
  */
 static void DecodeVision(uint16_t recv_len)
 {
-    static uint8_t stream_buf[VISION_RECV_SIZE * 4u];
-    static uint16_t stream_len = 0u;
-    uint8_t got_valid_packet = 0u;
-
-    if (recv_len == 0u)
-    {
-        return;
-    }
-
-    // 追加新数据到流缓冲
-    uint16_t append_len = recv_len;
-    if (append_len > sizeof(stream_buf))
-    {
-        append_len = (uint16_t)sizeof(stream_buf);
-    }
-
-    if (stream_len + append_len > sizeof(stream_buf))
-    {
-        uint16_t drop = (uint16_t)(stream_len + append_len - sizeof(stream_buf));
-        if (drop >= stream_len)
-        {
-            stream_len = 0u;
-        }
-        else
-        {
-            memmove(stream_buf, stream_buf + drop, stream_len - drop);
-            stream_len -= drop;
-        }
-    }
-
-    memcpy(stream_buf + stream_len, vis_recv_buff, append_len);
-    stream_len += append_len;
-
-    // 从流中提取完整帧（支持粘包/分包）
-    while (stream_len >= VISION_RECV_SIZE)
-    {
-        uint8_t header_pos = FindSPHeader(stream_buf, stream_len);
-        if (header_pos == 0xFF)
-        {
-            // 保留可能的半个帧头
-            if (stream_buf[stream_len - 1u] == VISION_SP_HEADER_1)
-            {
-                stream_buf[0] = VISION_SP_HEADER_1;
-                stream_len = 1u;
-            }
-            else
-            {
-                stream_len = 0u;
-            }
-            break;
-        }
-
-        if (header_pos > 0u)
-        {
-            memmove(stream_buf, stream_buf + header_pos, stream_len - header_pos);
-            stream_len -= header_pos;
-            if (stream_len < VISION_RECV_SIZE)
-            {
-                break;
-            }
-        }
-
-        VisionToGimbal_s *packet = (VisionToGimbal_s *)stream_buf;
-        if (!ValidateVisionDataFast(packet))
-        {
-            // 帧头后数据非法，右移一字节继续重同步
-            memmove(stream_buf, stream_buf + 1u, stream_len - 1u);
-            stream_len -= 1u;
-            continue;
-        }
-
-        ApplyVisionPacket(packet);
-        got_valid_packet = 1u;
-
-        if (stream_len > VISION_RECV_SIZE)
-        {
-            memmove(stream_buf, stream_buf + VISION_RECV_SIZE, stream_len - VISION_RECV_SIZE);
-            stream_len -= VISION_RECV_SIZE;
-        }
-        else
-        {
-            stream_len = 0u;
-        }
-    }
-
-    if (got_valid_packet)
-    {
-        DaemonReload(vision_daemon_instance); // 仅在有效包时喂狗
-    }
+    DecodeVisionBytes(vis_recv_buff, recv_len);
 }
 
 /* 视觉通信初始化 */

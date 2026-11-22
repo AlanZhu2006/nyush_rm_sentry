@@ -51,6 +51,37 @@ for dependency in "${dependencies[@]}"; do
   fi
 done
 
+fast_lio_dir="$workspace_src/FAST_LIO_ROS2"
+# vcstool does not populate Git submodules on a fresh import. Use the gitlink
+# recorded by the pinned parent commit, never the submodule branch tip.
+submodule_status="$(git -C "$fast_lio_dir" submodule status --recursive)"
+if printf '%s\n' "$submodule_status" | grep -Eq '^[+U]'; then
+  echo 'Error: an existing FAST-LIO submodule is at an unexpected commit.' >&2
+  exit 1
+fi
+git -C "$fast_lio_dir" submodule update --init --recursive
+submodule_status="$(git -C "$fast_lio_dir" submodule status --recursive)"
+if printf '%s\n' "$submodule_status" | grep -Eq '^[+U-]'; then
+  echo 'Error: FAST-LIO submodules do not match their recorded commits.' >&2
+  exit 1
+fi
+
+# Upstream stores both ROS manifests and ignores package.xml. Colcon needs
+# this exact ROS 2 manifest before dependency discovery; build.sh also clears
+# the whole workspace, so do not use it for a reproducible incremental build.
+livox_driver_dir="$workspace_src/livox_ros_driver2"
+if [ -e "$livox_driver_dir/package.xml" ]; then
+  if ! cmp -s "$livox_driver_dir/package_ROS2.xml" "$livox_driver_dir/package.xml"; then
+    echo 'Error: Livox package.xml differs from its pinned ROS 2 manifest.' >&2
+    exit 1
+  fi
+elif [ -L "$livox_driver_dir/package.xml" ]; then
+  echo 'Error: Livox package.xml is a broken symlink.' >&2
+  exit 1
+else
+  ln -s package_ROS2.xml "$livox_driver_dir/package.xml"
+fi
+
 for package_name in "${project_packages[@]}"; do
   source_path="$repository_root/ros2_ws/src/$package_name"
   target_path="$workspace_src/$package_name"
@@ -68,13 +99,12 @@ for package_name in "${project_packages[@]}"; do
   fi
 done
 
-fast_lio_dir="$workspace_src/FAST_LIO_ROS2"
 if git -C "$fast_lio_dir" apply --unidiff-zero --reverse --check \
     "$fast_lio_patch" >/dev/null 2>&1; then
   echo "[setup] FAST-LIO MID-360 patch is already applied."
 elif git -C "$fast_lio_dir" apply --unidiff-zero --check "$fast_lio_patch"; then
   git -C "$fast_lio_dir" apply --unidiff-zero "$fast_lio_patch"
-  echo "[setup] Applied FAST-LIO MID-360 density/latency patch."
+  echo "[setup] Applied FAST-LIO MID-360 density/latency/gravity-align patch."
 else
   echo "Error: FAST-LIO patch neither applies nor matches the working tree." >&2
   exit 1
@@ -82,7 +112,7 @@ fi
 
 fast_lio_status="$(git -C "$fast_lio_dir" status --short)"
 unexpected_fast_lio_status="$(printf '%s\n' "$fast_lio_status" |
-  grep -Ev '^ M (config/mid360.yaml|src/laserMapping.cpp)$' || true)"
+  grep -Ev '^ M (config/mid360.yaml|src/laserMapping.cpp|src/IMU_Processing.hpp)$' || true)"
 if [ -n "$unexpected_fast_lio_status" ]; then
   echo "Error: FAST-LIO contains changes outside the recorded patch:" >&2
   printf '%s\n' "$unexpected_fast_lio_status" >&2

@@ -12,6 +12,7 @@ install(PROGRAMS
   scripts/fastlio_odom_adapter.py
   scripts/save_map.sh
   scripts/sentry_nav2_bridge.py
+  scripts/sentry_vision_transport.py
   scripts/start_mapping.sh
   scripts/start_navigation.sh
   scripts/start_wasd.sh

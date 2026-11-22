@@ -1,0 +1,17 @@
+[Unit]
+Description=NYUSH sentry VNC desktop on localhost:5902
+ConditionPathExists=/usr/bin/tigervncserver
+ConditionPathExists=%h/.vnc/passwd
+
+[Service]
+Type=simple
+UMask=0077
+# Do not inherit GDM's short-lived authority file from the user manager.
+Environment=XAUTHORITY=%h/.vnc/sentry-Xauthority
+ExecStart=/usr/bin/tigervncserver :2 -fg -localhost yes -geometry 1920x1080 -depth 24 -xstartup %h/.vnc/sentry-xstartup
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target

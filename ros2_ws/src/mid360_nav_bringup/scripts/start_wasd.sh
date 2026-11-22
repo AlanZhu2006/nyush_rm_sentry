@@ -53,13 +53,14 @@ source_relaxed "$workspace_root/install/setup.bash"
 export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-42}"
 export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}"
 
-node_list="$(timeout 3 ros2 node list --no-daemon --spin-time 0.2 2>/dev/null || true)"
+# Reuse only if the processes are actually alive. A just-stopped mapping
+# stack can still appear in `ros2 node list` after its PIDs are gone.
 start_bridge=true
 start_mux=true
-if node_is_present /sentry_nav2_bridge "$node_list"; then
+if pgrep -f 'sentry_nav2_bridge.py' >/dev/null; then
   start_bridge=false
 fi
-if node_is_present /twist_mux "$node_list"; then
+if pgrep -f '/twist_mux/twist_mux' >/dev/null; then
   start_mux=false
 fi
 

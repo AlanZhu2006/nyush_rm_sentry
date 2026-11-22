@@ -1,0 +1,6 @@
+# STM32H723 USB CDC identity from Src/usbd_desc.c. Also applies to SSH users
+# after their dialout membership is active; uaccess covers local sessions.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="00ca", GROUP="dialout", MODE="0660", TAG+="uaccess", SYMLINK+="sentry-controller", ENV{ID_MM_DEVICE_IGNORE}="1"
+# STM32 ROM DFU and SEGGER debug interfaces.
+SUBSYSTEM=="usb", ATTR{idVendor}=="0483", ATTR{idProduct}=="df11", GROUP="plugdev", MODE="0660", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="1366", GROUP="plugdev", MODE="0660", TAG+="uaccess"

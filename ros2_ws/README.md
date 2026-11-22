@@ -1,5 +1,9 @@
 # Jetson ROS 2 full-stack reproduction
 
+For the x86_64 NUC13 host deployed on 2026-09-07, see
+[`NUC13_DEPLOYMENT.md`](NUC13_DEPLOYMENT.md). Its Ethernet interface and VNC
+display differ from the original Jetson defaults below.
+
 This directory is the source of truth for the sentry's Jetson stack. It keeps
 the project-owned ROS 2 packages beside the STM32 firmware, pins every external
 source dependency to a commit, records the required FAST-LIO changes as a
@@ -28,7 +32,7 @@ diagnostic topic until dynamic wheel-odometry validation is complete.
 | Chassis | four-module omnidirectional swerve |
 | Body envelope | `0.55 x 0.55 x 0.50 m` |
 | ROS convention | `+x` forward, `+y` left, `+z` up, positive yaw CCW |
-| MID-360 pose in `base_link` | `xyz = 0.0, -0.11, 0.35 m`, zero RPY |
+| MID-360 pose in `base_link` | `xyz = 0.0, -0.11, 0.35 m`, rpy `-1.030, +59.470, 0` deg |
 | FAST-LIO IMU-to-LiDAR translation | `[-0.011, -0.02329, 0.04412] m` |
 | Jetson LiDAR NIC | `enP8p1s0`, `192.168.1.50/24`, no default route |
 | MID-360 | `192.168.1.182` |
@@ -112,11 +116,11 @@ source install/setup.bash
 ```
 
 The FAST-LIO patch is required, not optional. It uses every MID-360 point
-(`point_filter_num=1`), changes both voxel filters from 0.50 to 0.35 m, changes
-the LiDAR subscription to latest-sample sensor QoS, and avoids constructing
-large point-cloud/path messages when no subscriber exists. On this Jetson it
-reduced the observed navigation data delay from roughly 2.1 s to about
-0.12-0.19 s while retaining enough geometry for ICP.
+(`point_filter_num=1`), changes both voxel filters from 0.50 to 0.35 m, gravity-aligns
+`camera_init` so world +Z is up, changes the LiDAR subscription to latest-sample
+sensor QoS, and avoids constructing large point-cloud/path messages when no
+subscriber exists. On this Jetson it reduced the observed navigation data delay
+from roughly 2.1 s to about 0.12-0.19 s while retaining enough geometry for ICP.
 
 ## 4. Build and flash the STM32 firmware
 
@@ -146,9 +150,9 @@ All daily entry points live in the repository Justfile. They use
 package scripts; no untracked wrapper or shell alias is required.
 
 ```bash
-just map arena          # MID-360 + FAST-LIO mapping + RViz
+just map arena          # MID-360 + FAST-LIO mapping + RViz; Ctrl-C auto-saves
 just wasd               # browser teleop, higher priority than Nav2
-just map-save arena     # save matching PCD + filtered PGM/YAML
+just map-save arena     # save matching PCD + filtered PGM/YAML without stopping
 just nav arena          # FAST-LIO + guarded ICP + Nav2 MPPI + RViz
 just logger             # RTT dashboard at http://JETSON_IP:8765/
 ```
@@ -159,6 +163,13 @@ control after pressing the page's enable button. On a shared network, pass a
 fresh `--token`, bind to localhost and tunnel over SSH, or restrict port 8088 in
 the firewall. The RTT dashboard on 8765 is also unauthenticated and should be
 treated as trusted-LAN diagnostics.
+
+The WASD page also has a gimbal **preview** panel for small yaw (GM6020),
+pitch (GM6020), and large yaw (LK9025), including manual, cruise, and combined
+scan requests. It publishes only `/gimbal/cmd_vel_preview`; the current ROS
+bridge and MCU do not drive gimbal motors from this topic. See
+[`docs/sentry-gimbal-staging.md`](../docs/sentry-gimbal-staging.md) for the axis
+mapping, limits, and hardware information needed before actuator integration.
 
 `just nav` deliberately requires a map name. There is no hidden fallback to
 `/home/nyu/b1.*`. A custom pair may be selected with `NAV_MAP_YAML` and

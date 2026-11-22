@@ -6,7 +6,7 @@ default:
 make_cmd := if os_family() == "windows" { "mingw32-make" } else { "make" }
 default_robot := "infantry"
 default_jobs := "12"
-default_pyocd_target := "STM32H723VG"
+default_pyocd_target := "stm32h723vghx"
 default_pyocd_connect := "under-reset"
 local_robot_file := ".robot_type"
 local_vscode_robot_header := ".vscode/robot_type.local.h"
@@ -39,6 +39,14 @@ _ensure-py:
 _py script *args:
   @py="$(just _ensure-py)"; \
   root="{{justfile_directory()}}"; \
+  if [[ "{{os_family()}}" == "unix" ]]; then \
+    for jlink_lib_dir in "${JLINK_LIB_DIR:-}" "${HOME}/.local/opt"/JLink_Linux_*; do \
+      if [[ -n "${jlink_lib_dir}" && -f "${jlink_lib_dir}/libjlinkarm.so" ]]; then \
+        export LD_LIBRARY_PATH="${jlink_lib_dir}:${LD_LIBRARY_PATH:-}"; \
+        break; \
+      fi; \
+    done; \
+  fi; \
   exec "${py}" "${root}/{{script}}" {{args}}
 
 # Show all available recipes.
@@ -308,3 +316,121 @@ py-bootstrap:
 # Print python interpreter selected by env checker.
 py-which:
   @just _ensure-py
+
+# Recreate the pinned ROS source workspace, including the recorded patch.
+ros-setup:
+  bash ros2_ws/setup_workspace.sh
+
+# Build/install Livox-SDK2 in the user prefix; no root build is needed.
+livox-sdk jobs="4":
+  @workspace="${ROBOT_WS:-${HOME}/robot_ws}"; \
+  cmake -S "${workspace}/src/Livox-SDK2" -B "${workspace}/build/livox_sdk2" \
+    -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="${HOME}/.local"; \
+  cmake --build "${workspace}/build/livox_sdk2" --parallel {{jobs}}; \
+  cmake --install "${workspace}/build/livox_sdk2"
+
+# Build the full ROS 2 workspace with bounded memory use on a 16 GB NUC.
+ros-build-all jobs="4":
+  @workspace="${ROBOT_WS:-${HOME}/robot_ws}"; \
+  set +u; source "${ROS_SETUP:-/opt/ros/${ROS_DISTRO:-humble}/setup.bash}"; set -u; \
+  export CMAKE_PREFIX_PATH="${HOME}/.local:${CMAKE_PREFIX_PATH:-}"; \
+  export LD_LIBRARY_PATH="${HOME}/.local/lib:${LD_LIBRARY_PATH:-}"; \
+  export CMAKE_BUILD_PARALLEL_LEVEL={{jobs}} MAKEFLAGS="-j{{jobs}}"; \
+  cd "${workspace}"; \
+  colcon build --symlink-install --executor sequential \
+    --cmake-args -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="${HOME}/.local" \
+      -DROS_EDITION=ROS2 -DDISTRO_ROS=humble
+
+# Verify source/map integrity without touching a USB controller.
+repro-check:
+  bash ros2_ws/setup_workspace.sh
+  cd ros2_ws/src/mid360_nav_bringup/maps && sha256sum -c SHA256SUMS
+  git diff --check
+
+# Preview the exact host package transaction without requiring root.
+host-packages-check:
+  bash ros2_ws/system/install_nuc_host.sh --simulate
+
+# Exercise the USB/ROS boundary without accessing real hardware or the LAN.
+offline-check:
+  @set +u; source /opt/ros/humble/setup.bash; set -u; \
+  export ROS_LOCALHOST_ONLY=1 ROS_DOMAIN_ID=181; \
+  /usr/bin/python3 ros2_ws/system/offline_check.py
+
+# Check installed Nav2/ICP/RViz with synthetic localhost data, never hardware.
+runtime-check:
+  @workspace="${ROBOT_WS:-${HOME}/robot_ws}"; \
+  set +u; source /opt/ros/humble/setup.bash; source "${workspace}/install/setup.bash"; set -u; \
+  export ROS_LOCALHOST_ONLY=1 ROS_DOMAIN_ID=182 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp; \
+  export CYCLONEDDS_URI="file://{{justfile_directory()}}/ros2_ws/system/cyclonedds-test.xml"; \
+  export DISPLAY=:2 XAUTHORITY="${HOME}/.vnc/sentry-Xauthority"; \
+  /usr/bin/python3 ros2_ws/system/runtime_check.py
+
+# Exercise the standalone PCD converter without overwriting the recorded map.
+map-converter-check:
+  @workspace="${ROBOT_WS:-${HOME}/robot_ws}"; \
+  test_dir="$(mktemp -d /tmp/nyush-sentry-map-check.XXXXXX)"; \
+  "${workspace}/install/icp_probe/lib/icp_probe/pcd_to_pgm" \
+    --input ros2_ws/src/mid360_nav_bringup/maps/arena.pcd --output "${test_dir}/arena"
+
+# Install the exact MCU's CMSIS device support for the documented pyOCD target.
+debug-setup:
+  @py="$(just _ensure-py)"; "${py}" -m pyocd pack install STM32H723VG
+
+# Audit all ROS package dependencies against the package database.
+ros-deps-check:
+  @workspace="${ROBOT_WS:-${HOME}/robot_ws}"; \
+  rosdep check --from-paths "${workspace}/src" --ignore-src --rosdistro humble
+
+# Configure an SSH-tunneled VNC desktop after host packages are installed.
+vnc-setup:
+  bash ros2_ws/system/configure_nuc_vnc.sh
+
+# Check deployment script syntax and the Linux editor configuration.
+deployment-check:
+  @for script in ros2_ws/setup_workspace.sh ros2_ws/system/install_nuc_host.sh ros2_ws/system/configure_nuc_vnc.sh ros2_ws/system/sentry-xstartup; do bash -n "${script}"; done
+  @/usr/bin/python3 -c 'import ast, pathlib; [ast.parse(p.read_text(), filename=str(p)) for p in pathlib.Path("ros2_ws/system").glob("*_check.py")]'
+  /usr/bin/python3 -m json.tool .vscode/c_cpp_properties.json >/dev/null
+  git diff --check
+
+# Check installed debugger tooling without opening or resetting a target.
+debug-check:
+  @py="$(just _ensure-py)"; \
+  "${py}" -m pyocd list --targets | grep -i 'stm32h723vghx'; \
+  LD_LIBRARY_PATH="${HOME}/.local/opt/JLink_Linux_V972_x86_64:${LD_LIBRARY_PATH:-}" \
+    "${py}" -c 'import pylink; link = pylink.JLink(); print("SEGGER library:", link.version); print("Probes:", link.connected_emulators())'
+  @just logger --help >/dev/null
+
+# Report the exact built MCU artifact and active standalone entry point.
+artifact-check:
+  arm-none-eabi-size build/nyush_rm_control_h723.elf
+  sha256sum build/nyush_rm_control_h723.elf build/nyush_rm_control_h723.hex build/nyush_rm_control_h723.bin
+  arm-none-eabi-nm build/nyush_rm_control_h723.elf | grep ' T SentrySteerNav2Init'
+
+# Resume this NUC's deployment; sudo authenticates in the user's terminal.
+# This never flashes firmware or starts a robot control/navigation process.
+finish-nuc-deploy:
+  sudo bash ros2_ws/system/install_nuc_host.sh nyush enp86s0
+  rosdep update --rosdistro humble
+  just py-bootstrap
+  just ros-setup
+  just ros-deps-check
+  just livox-sdk 4
+  just ros-build-all 4
+  just build sentry_swerve 8
+  RMW_IMPLEMENTATION=rmw_cyclonedds_cpp just offline-check
+  just map-converter-check
+  just vnc-setup
+  just deployment-check
+
+# Host checks only; never opens physical robot devices.
+vision-protocol-check:
+  python3 scripts/diagnostics/check_sentry_vision.py
+
+vision-bridge-check:
+  python3 scripts/diagnostics/check_vision_bridge.py
+
+# Own USB for this checkout and expose the shared SP vision PTY.
+# Do not run alongside another navigation bridge owning the same USB device.
+vision-bridge *args:
+  @source /opt/ros/humble/setup.bash; exec /usr/bin/python3 "{{justfile_directory()}}/ros2_ws/src/mid360_nav_bringup/scripts/sentry_nav2_bridge.py" {{args}}

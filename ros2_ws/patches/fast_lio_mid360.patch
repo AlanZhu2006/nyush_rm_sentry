@@ -14,6 +14,33 @@ index b940253..c178154 100644
 -                                        # -1 : all frames will be saved in ONE pcd file, may lead to memory crash when having too much frames.
 \ No newline at end of file
 +                                        # -1 : all frames will be saved in ONE pcd file, may lead to memory crash when having too much frames.
+diff --git a/src/IMU_Processing.hpp b/src/IMU_Processing.hpp
+index f35378f..40fca19 100644
+--- a/src/IMU_Processing.hpp
++++ b/src/IMU_Processing.hpp
+@@ -9,0 +10 @@
++#include <Eigen/Geometry>
+@@ -193,3 +194,11 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom,
+-  init_state.grav = S2(- mean_acc / mean_acc.norm() * G_m_s2);
+-  
+-  //state_inout.rot = Eye3d; // Exp(mean_acc.cross(V3D(0, 0, -1 / scale_gravity)));
++  // Livox reports specific force (points up when static). Align camera_init so
++  // world +Z is up and gravity in the world frame is (0, 0, -g). Keep yaw at 0
++  // so this rotation matches the URDF rpy of livox_frame in base_link.
++  const double acc_norm = mean_acc.norm();
++  const double roll = std::atan2(mean_acc[1], mean_acc[2]);
++  const double pitch = std::atan2(-mean_acc[0], std::hypot(mean_acc[1], mean_acc[2]));
++  const M3D R_wi = (Eigen::AngleAxisd(pitch, V3D::UnitY()) *
++                    Eigen::AngleAxisd(roll, V3D::UnitX())).toRotationMatrix();
++  const V3D grav_imu = -mean_acc / acc_norm * G_m_s2;
++  init_state.rot = SO3(R_wi);
++  init_state.grav = S2(R_wi * grav_imu);
+@@ -364 +373,4 @@ void ImuProcess::Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom,
+-      std::cout << "IMU Initial Done" << std::endl;
++      const vect3 rpy_deg = SO3ToEuler(imu_state.rot);
++      std::cout << "IMU Initial Done. camera_init Z-up, IMU rpy(deg) = "
++                << rpy_deg[0] << ", " << rpy_deg[1] << ", " << rpy_deg[2]
++                << std::endl;
 diff --git a/src/laserMapping.cpp b/src/laserMapping.cpp
 index d441261..c5ab365 100644
 --- a/src/laserMapping.cpp

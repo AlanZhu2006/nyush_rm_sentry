@@ -4,10 +4,14 @@ generated map names remain ignored until they are deliberately reviewed.
 
 Verify the tracked set with `sha256sum -c SHA256SUMS` from this directory.
 
-Create and save a map named `arena` with:
+Create and save a map named `arena` with the chassis on level ground:
 
   just map arena
-  just map-save arena
+  # Ctrl-C in that terminal saves PCD + PGM/YAML. `just map-save arena`
+  # still works if you want a snapshot without stopping mapping.
+
+FAST-LIO now gravity-aligns `camera_init`. Maps recorded before that change
+cannot be mixed with a gravity-aligned live cloud; remap after updating.
 
 The resulting `arena.pcd`, `arena.pgm`, and `arena.yaml` must stay together.
 The PCD is used by ICP localization; the PGM/YAML pair is used by Nav2.

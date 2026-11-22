@@ -37,13 +37,22 @@ configure_rviz_display() {
     return
   fi
 
+  # Prefer the NUC TigerVNC desktop (:2). Do not keep an SSH forwarded DISPLAY
+  # such as localhost:10.0 — RViz would abort there instead of appearing in VNC.
+  if [ -S /tmp/.X11-unix/X2 ] && [ -r "${HOME}/.vnc/sentry-Xauthority" ]; then
+    export DISPLAY=:2
+    export XAUTHORITY="${HOME}/.vnc/sentry-Xauthority"
+    return
+  fi
+
+  if [ -S /tmp/.X11-unix/X1 ]; then
+    export DISPLAY=:1
+    export XAUTHORITY="${NAV_RVIZ_XAUTHORITY:-${HOME}/.Xauthority}"
+    return
+  fi
+
   if [ -n "${SSH_CONNECTION:-}" ]; then
-    if [ -S /tmp/.X11-unix/X1 ]; then
-      export DISPLAY=:1
-      export XAUTHORITY="${HOME}/.Xauthority"
-    else
-      echo "Warning: SSH detected but VNC display :1 is unavailable; RViz may not start." >&2
-    fi
+    echo "Warning: SSH detected but no VNC display (:2 or :1) is available; RViz may not start." >&2
   fi
 }
 
@@ -76,13 +85,60 @@ if [[ ! "$map_name" =~ ^[A-Za-z0-9._-]+$ ]]; then
 fi
 
 pcd_path="$maps_dir/$map_name.pcd"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+save_map_script="$script_dir/save_map.sh"
 mkdir -p "$maps_dir"
 echo ">>> Starting MID-360 + FAST-LIO mapping"
 echo "    PCD output: $pcd_path"
 echo "    RViz display: ${DISPLAY:-not set}"
 echo "    Drive with /cmd_vel_teleop; Nav2 is not active in mapping mode."
-echo "    When finished, run in another terminal: just map-save $map_name"
+echo "    Ctrl-C saves $map_name (PCD + PGM/YAML) then stops the stack."
+echo "    Skip the save with FASTLIO_MAP_AUTOSAVE=0. Manual save: just map-save $map_name"
 
-exec ros2 launch mid360_nav_bringup fastlio_mapping.launch.py \
+launch_pid=""
+stopping=0
+
+stop_launch() {
+  if [ -z "$launch_pid" ]; then
+    return
+  fi
+  if kill -0 "$launch_pid" 2>/dev/null; then
+    kill -INT -- "-$launch_pid" 2>/dev/null || kill -INT "$launch_pid" 2>/dev/null || true
+    wait "$launch_pid" 2>/dev/null || true
+  fi
+}
+
+on_stop() {
+  if [ "$stopping" -eq 1 ]; then
+    return
+  fi
+  stopping=1
+  trap '' INT TERM
+  if [ -n "$launch_pid" ] && kill -0 "$launch_pid" 2>/dev/null \
+      && [[ "${FASTLIO_MAP_AUTOSAVE:-1}" != "0" ]]; then
+    echo ">>> Ctrl-C: saving map '$map_name' before shutdown"
+    if ! "$save_map_script" "$map_name"; then
+      echo "Warning: auto-save failed; shutting down mapping anyway." >&2
+    fi
+  fi
+  echo ">>> Stopping mapping stack"
+  stop_launch
+  exit 0
+}
+
+trap on_stop INT TERM
+
+# Own process group so the TTY Ctrl-C hits this wrapper first, not ros2 launch.
+# Otherwise FAST-LIO dies before /map_save can write the PCD.
+set -m
+ros2 launch mid360_nav_bringup fastlio_mapping.launch.py \
   pcd_path:="$pcd_path" \
-  "$@"
+  "$@" &
+launch_pid=$!
+set +m
+
+set +e
+wait "$launch_pid"
+launch_rc=$?
+set -e
+exit "$launch_rc"

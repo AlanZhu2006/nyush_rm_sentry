@@ -22,6 +22,17 @@
 
 /* USER CODE BEGIN 0 */
 
+static void FdcanSetPinsVeryHigh(GPIO_TypeDef *port, uint32_t pins, uint32_t alternate)
+{
+  GPIO_InitTypeDef gpio = {0};
+  gpio.Pin = pins;
+  gpio.Mode = GPIO_MODE_AF_PP;
+  gpio.Pull = GPIO_NOPULL;
+  gpio.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+  gpio.Alternate = alternate;
+  HAL_GPIO_Init(port, &gpio);
+}
+
 /* USER CODE END 0 */
 
 FDCAN_HandleTypeDef hfdcan1;
@@ -208,7 +219,7 @@ void HAL_FDCAN_MspInit(FDCAN_HandleTypeDef* fdcanHandle)
     HAL_NVIC_SetPriority(FDCAN1_IT1_IRQn, 5, 0);
     HAL_NVIC_EnableIRQ(FDCAN1_IT1_IRQn);
   /* USER CODE BEGIN FDCAN1_MspInit 1 */
-
+    FdcanSetPinsVeryHigh(GPIOD, GPIO_PIN_0 | GPIO_PIN_1, GPIO_AF9_FDCAN1);
   /* USER CODE END FDCAN1_MspInit 1 */
   }
   else if(fdcanHandle->Instance==FDCAN2)
@@ -240,7 +251,7 @@ void HAL_FDCAN_MspInit(FDCAN_HandleTypeDef* fdcanHandle)
     HAL_NVIC_SetPriority(FDCAN2_IT1_IRQn, 5, 0);
     HAL_NVIC_EnableIRQ(FDCAN2_IT1_IRQn);
   /* USER CODE BEGIN FDCAN2_MspInit 1 */
-
+    FdcanSetPinsVeryHigh(GPIOB, GPIO_PIN_5 | GPIO_PIN_6, GPIO_AF9_FDCAN2);
   /* USER CODE END FDCAN2_MspInit 1 */
   }
   else if(fdcanHandle->Instance==FDCAN3)
@@ -272,7 +283,7 @@ void HAL_FDCAN_MspInit(FDCAN_HandleTypeDef* fdcanHandle)
     HAL_NVIC_SetPriority(FDCAN3_IT1_IRQn, 5, 0);
     HAL_NVIC_EnableIRQ(FDCAN3_IT1_IRQn);
   /* USER CODE BEGIN FDCAN3_MspInit 1 */
-
+    FdcanSetPinsVeryHigh(GPIOD, GPIO_PIN_12 | GPIO_PIN_13, GPIO_AF5_FDCAN3);
   /* USER CODE END FDCAN3_MspInit 1 */
   }
 }

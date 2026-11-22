@@ -1,3 +1,4 @@
+import sys
 from pathlib import Path
 
 from ament_index_python.packages import get_package_share_directory
@@ -7,6 +8,11 @@ from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+
+_LAUNCH_DIR = Path(__file__).resolve().parent
+if str(_LAUNCH_DIR) not in sys.path:
+    sys.path.insert(0, str(_LAUNCH_DIR))
+from lidar_mount import LIDAR_PITCH, LIDAR_ROLL, LIDAR_X, LIDAR_Y, LIDAR_YAW, LIDAR_Z
 
 
 def generate_launch_description():
@@ -33,12 +39,12 @@ def generate_launch_description():
         DeclareLaunchArgument('base_length', default_value='0.55'),
         DeclareLaunchArgument('base_width', default_value='0.55'),
         DeclareLaunchArgument('base_height', default_value='0.50'),
-        DeclareLaunchArgument('lidar_x', default_value='0.0'),
-        DeclareLaunchArgument('lidar_y', default_value='-0.11'),
-        DeclareLaunchArgument('lidar_z', default_value='0.35'),
-        DeclareLaunchArgument('lidar_roll', default_value='0.0'),
-        DeclareLaunchArgument('lidar_pitch', default_value='0.0'),
-        DeclareLaunchArgument('lidar_yaw', default_value='0.0'),
+        DeclareLaunchArgument('lidar_x', default_value=LIDAR_X),
+        DeclareLaunchArgument('lidar_y', default_value=LIDAR_Y),
+        DeclareLaunchArgument('lidar_z', default_value=LIDAR_Z),
+        DeclareLaunchArgument('lidar_roll', default_value=LIDAR_ROLL),
+        DeclareLaunchArgument('lidar_pitch', default_value=LIDAR_PITCH),
+        DeclareLaunchArgument('lidar_yaw', default_value=LIDAR_YAW),
 
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(str(sensors_launch)),

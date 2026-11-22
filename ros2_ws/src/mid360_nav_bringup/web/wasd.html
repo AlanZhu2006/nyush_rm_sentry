@@ -132,6 +132,11 @@
     }
     .message { min-height: 22px; margin-top: 14px; color: var(--muted); font-size: 13px; text-align: center; }
     .message.error { color: var(--red); }
+    .gimbal-card { margin-top: 18px; }
+    .gimbal-controls { display: grid; grid-template-columns: repeat(3, 1fr); gap: 11px; margin-top: 16px; }
+    .gimbal-controls .key { min-height: 72px; font-size: 23px; }
+    .gimbal-readout { display: flex; gap: 16px; flex-wrap: wrap; margin-top: 15px; color: var(--muted); font-size: 13px; }
+    .gimbal-readout strong { color: var(--text); font-variant-numeric: tabular-nums; }
     kbd { border: 1px solid var(--line); border-bottom-width: 3px; border-radius: 6px; padding: 1px 5px; background: var(--panel); font-family: inherit; }
     @media (max-width: 760px) {
       body { padding: 14px; }
@@ -189,6 +194,31 @@
         </div>
       </aside>
     </div>
+
+    <section class="card gimbal-card" aria-label="云台预览控制">
+      <div class="toolbar">
+        <button id="gimbalEnable" class="enable" type="button">ENABLE GIMBAL PREVIEW</button>
+        <select id="gimbalMode" aria-label="云台模式">
+          <option value="manual">手动 · 小 yaw / pitch / 大 yaw</option>
+          <option value="cruise">巡航 · 大 yaw 匀速</option>
+          <option value="scan">联动预览 · 大 yaw + pitch 往复</option>
+        </select>
+      </div>
+      <div class="gimbal-controls" aria-label="云台按键">
+        <button class="key" data-key="j" type="button">J<small>小 yaw 左</small></button>
+        <button class="key" data-key="i" type="button">I<small>pitch 上</small></button>
+        <button class="key" data-key="l" type="button">L<small>小 yaw 右</small></button>
+        <button class="key" data-key="u" type="button">U<small>大 yaw 逆时针</small></button>
+        <button class="key" data-key="k" type="button">K<small>pitch 下</small></button>
+        <button class="key" data-key="o" type="button">O<small>大 yaw 顺时针</small></button>
+      </div>
+      <div class="gimbal-readout">
+        <span>小 yaw <strong id="smallYawRate">0.00 rad/s</strong></span>
+        <span>pitch <strong id="pitchRate">0.00 rad/s</strong></span>
+        <span>大 yaw <strong id="bigYawRate">0.00 rad/s</strong></span>
+      </div>
+      <div class="notice">云台区域目前只发布 ROS 预览指令，尚未连接 H7 电机输出。切换模式会解除云台预览，需再次点击启用。巡航与联动预览均不能用于实物扫描，直到完成 CAN、零位、限位与失联保护标定。</div>
+    </section>
   </main>
 
   <script>
@@ -205,13 +235,21 @@
     const client = sessionStorage.getItem("nyushTeleopClient") || createClientId();
     sessionStorage.setItem("nyushTeleopClient", client);
 
-    const allowed = new Set(["w", "a", "s", "d", "q", "e"]);
+    const chassisKeys = new Set(["w", "a", "s", "d", "q", "e"]);
+    const gimbalKeys = new Set(["i", "j", "k", "l", "u", "o"]);
+    const allowed = new Set([...chassisKeys, ...gimbalKeys]);
     const pressed = new Set();
+    let ownsControl = false;
     let armed = false;
+    let gimbalArmed = false;
+    let gimbalMode = "manual";
     let sequence = 0;
     let speedScale = 1.0;
     let linearLimit = 0.80;
     let angularLimit = 2.40;
+    let smallYawLimit = 0.25;
+    let pitchLimit = 0.18;
+    let bigYawLimit = 0.15;
     let requestFailed = false;
 
     const elements = {
@@ -220,6 +258,11 @@
       enable: document.getElementById("enable"),
       scale: document.getElementById("speedScale"),
       stop: document.getElementById("stop"),
+      gimbalEnable: document.getElementById("gimbalEnable"),
+      gimbalMode: document.getElementById("gimbalMode"),
+      smallYawRate: document.getElementById("smallYawRate"),
+      pitchRate: document.getElementById("pitchRate"),
+      bigYawRate: document.getElementById("bigYawRate"),
       message: document.getElementById("message"),
       linear: document.getElementById("linear"),
       angular: document.getElementById("angular"),
@@ -256,21 +299,37 @@
     function render(message = "") {
       const vector = commandVector();
       const moving = armed && (vector.vx !== 0 || vector.vy !== 0 || vector.wz !== 0);
-      elements.status.className = `status ${requestFailed ? "error" : moving ? "moving" : armed ? "armed" : "connected"}`;
-      elements.statusText.textContent = requestFailed ? "CONNECTION LOST" : moving ? "MOVING" : armed ? "ARMED" : "DISARMED";
+      elements.status.className = `status ${requestFailed ? "error" : moving ? "moving" : armed || gimbalArmed ? "armed" : "connected"}`;
+      elements.statusText.textContent = requestFailed ? "CONNECTION LOST" : moving ? "MOVING" : gimbalArmed && !armed ? "GIMBAL PREVIEW" : armed ? "ARMED" : "DISARMED";
       elements.enable.classList.toggle("on", armed);
       elements.enable.textContent = armed ? "DISABLE CONTROL" : "ENABLE CONTROL";
+      elements.gimbalEnable.classList.toggle("on", gimbalArmed);
+      elements.gimbalEnable.textContent = gimbalArmed ? "DISABLE GIMBAL PREVIEW" : "ENABLE GIMBAL PREVIEW";
       elements.keyButtons.forEach(button => button.classList.toggle("pressed", pressed.has(button.dataset.key)));
       elements.activeKeys.textContent = pressed.size ? [...pressed].map(key => key.toUpperCase()).join(" + ") : "—";
       elements.linear.textContent = `${(Math.hypot(vector.vx, vector.vy) * linearLimit * speedScale).toFixed(2)} m/s`;
       elements.angular.textContent = `${(vector.wz * angularLimit * speedScale).toFixed(2)} rad/s`;
-      elements.message.textContent = message || (armed ? "控制已启用；保持页面在前台" : "点击 ENABLE CONTROL 后开始操作");
+      const smallYaw = gimbalArmed && gimbalMode === "manual"
+        ? (Number(pressed.has("j")) - Number(pressed.has("l"))) * smallYawLimit * speedScale : 0;
+      const pitch = gimbalArmed && gimbalMode === "manual"
+        ? (Number(pressed.has("i")) - Number(pressed.has("k"))) * pitchLimit * speedScale : 0;
+      const bigYaw = gimbalArmed && gimbalMode === "manual"
+        ? (Number(pressed.has("u")) - Number(pressed.has("o"))) * bigYawLimit * speedScale
+        : gimbalArmed ? bigYawLimit * speedScale : 0;
+      elements.smallYawRate.textContent = `${smallYaw.toFixed(2)} rad/s`;
+      elements.pitchRate.textContent = gimbalArmed && gimbalMode === "scan" ? "往复预览" : `${pitch.toFixed(2)} rad/s`;
+      elements.bigYawRate.textContent = `${bigYaw.toFixed(2)} rad/s`;
+      elements.message.textContent = message || (armed ? "底盘控制已启用；保持页面在前台" : gimbalArmed ? "仅云台预览已启用；底盘未使能" : "点击 ENABLE CONTROL 后开始操作");
       elements.message.classList.toggle("error", requestFailed);
     }
 
     async function claimControl() {
       pressed.clear();
+      gimbalArmed = false;
+      gimbalMode = "manual";
+      elements.gimbalMode.value = gimbalMode;
       const data = await api("/api/claim", "POST", {client});
+      ownsControl = true;
       armed = true;
       requestFailed = false;
       render("已取得控制权");
@@ -285,6 +344,8 @@
         armed,
         keys: [...pressed],
         speed_scale: speedScale,
+        gimbal_armed: gimbalArmed,
+        gimbal_mode: gimbalMode,
       };
       try {
         const data = await api("/api/control", "POST", payload, keepalive);
@@ -292,15 +353,19 @@
         applyServerState(data.state);
       } catch (error) {
         requestFailed = true;
+        ownsControl = false;
         armed = false;
+        gimbalArmed = false;
         pressed.clear();
         render(error.message);
       }
     }
 
     async function releaseControl(reason = "控制已解除") {
-      const held = armed;
+      const held = ownsControl;
+      ownsControl = false;
       armed = false;
+      gimbalArmed = false;
       pressed.clear();
       render(reason);
       if (!held) return;
@@ -317,12 +382,17 @@
       if (!state) return;
       linearLimit = Number(state.linear_speed ?? linearLimit);
       angularLimit = Number(state.angular_speed ?? angularLimit);
+      smallYawLimit = Number(state.small_yaw_speed ?? smallYawLimit);
+      pitchLimit = Number(state.pitch_speed ?? pitchLimit);
+      bigYawLimit = Number(state.big_yaw_speed ?? bigYawLimit);
       if (state.watchdog_s) elements.watchdog.textContent = `${Math.round(state.watchdog_s * 1000)} ms`;
       render();
     }
 
     function pressKey(key) {
-      if (!armed || pressed.has(key)) return;
+      if (pressed.has(key)) return;
+      if (chassisKeys.has(key) && !armed) return;
+      if (gimbalKeys.has(key) && (!gimbalArmed || gimbalMode !== "manual")) return;
       pressed.add(key);
       render();
       void sendControl();
@@ -336,8 +406,11 @@
 
     function stopMotion() {
       pressed.clear();
+      gimbalArmed = false;
+      gimbalMode = "manual";
+      elements.gimbalMode.value = gimbalMode;
       render("零速已发送");
-      if (armed) void sendControl();
+      if (ownsControl) void sendControl();
     }
 
     elements.enable.addEventListener("click", async () => {
@@ -345,7 +418,9 @@
         if (armed) await releaseControl(); else await claimControl();
       } catch (error) {
         requestFailed = true;
+        ownsControl = false;
         armed = false;
+        gimbalArmed = false;
         pressed.clear();
         render(error.message);
       }
@@ -353,7 +428,33 @@
     elements.scale.addEventListener("change", () => {
       speedScale = Number(elements.scale.value);
       render();
-      if (armed) void sendControl();
+      if (armed || gimbalArmed) void sendControl();
+    });
+    elements.gimbalEnable.addEventListener("click", async () => {
+      try {
+        if (gimbalArmed && !armed) { await releaseControl(); return; }
+        if (!ownsControl) {
+          await api("/api/claim", "POST", {client});
+          ownsControl = true;
+        }
+        gimbalArmed = !gimbalArmed;
+        for (const key of gimbalKeys) pressed.delete(key);
+        render();
+        await sendControl();
+      } catch (error) {
+        requestFailed = true;
+        ownsControl = false;
+        gimbalArmed = false;
+        pressed.clear();
+        render(error.message);
+      }
+    });
+    elements.gimbalMode.addEventListener("change", () => {
+      gimbalMode = elements.gimbalMode.value;
+      gimbalArmed = false;
+      for (const key of gimbalKeys) pressed.delete(key);
+      render("模式已切换；请重新启用云台预览");
+      if (ownsControl) void sendControl();
     });
     elements.stop.addEventListener("pointerdown", event => { event.preventDefault(); stopMotion(); });
 
@@ -373,6 +474,7 @@
       const key = event.key.toLowerCase();
       if (key === "escape") { event.preventDefault(); void releaseControl("Esc：控制已解除"); return; }
       if (key === " ") { event.preventDefault(); stopMotion(); return; }
+      if (event.target instanceof HTMLElement && event.target.matches("input, select, textarea")) return;
       if (!allowed.has(key)) return;
       event.preventDefault();
       if (!event.repeat) pressKey(key);
@@ -383,20 +485,22 @@
       event.preventDefault();
       releaseKey(key);
     });
-    window.addEventListener("blur", () => { if (armed) void releaseControl("页面失焦：已自动停车"); });
+    window.addEventListener("blur", () => { if (armed || gimbalArmed) void releaseControl("页面失焦：已自动停车"); });
     document.addEventListener("visibilitychange", () => {
-      if (document.hidden && armed) void releaseControl("页面隐藏：已自动停车");
+      if (document.hidden && (armed || gimbalArmed)) void releaseControl("页面隐藏：已自动停车");
     });
     window.addEventListener("pagehide", () => {
       armed = false;
+      gimbalArmed = false;
+      ownsControl = false;
       pressed.clear();
       const body = new Blob([JSON.stringify({client})], {type: "application/json"});
       navigator.sendBeacon(apiUrl("/api/release"), body);
     });
 
-    setInterval(() => { if (armed) void sendControl(); }, 100);
+    setInterval(() => { if (armed || gimbalArmed) void sendControl(); }, 100);
     setInterval(async () => {
-      if (armed) return;
+      if (armed || gimbalArmed) return;
       try {
         const data = await api("/api/state");
         requestFailed = false;

@@ -25,10 +25,12 @@
 #define CHASSIS_STEER_MOTOR_LB_ID 4
 
 // Measured mechanical zero positions (GM6020 single-turn ECD, 0..8191).
-#define CHASSIS_STEER_MOTOR_LF_ZERO_ECD 5484u
-#define CHASSIS_STEER_MOTOR_RF_ZERO_ECD 702u
-#define CHASSIS_STEER_MOTOR_RB_ZERO_ECD 3407u
-#define CHASSIS_STEER_MOTOR_LB_ZERO_ECD 6106u
+// Recaptured 2026-09-20 17:20 after physically squaring all four modules
+// to vehicle-forward. Previous zeros were ~90 deg off this heading.
+#define CHASSIS_STEER_MOTOR_LF_ZERO_ECD 6141u
+#define CHASSIS_STEER_MOTOR_RF_ZERO_ECD 6814u
+#define CHASSIS_STEER_MOTOR_RB_ZERO_ECD 1358u
+#define CHASSIS_STEER_MOTOR_LB_ZERO_ECD 4081u
 
 // USB keyboard steering test settings. ID order is LF, RF, left-rear, right-rear.
 #define CHASSIS_STEER_KEYBOARD_ONLINE_STABLE_MS 200u
