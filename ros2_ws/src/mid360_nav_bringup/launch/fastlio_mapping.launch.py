@@ -10,10 +10,10 @@ from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 
-_LAUNCH_DIR = Path(__file__).resolve().parent
-if str(_LAUNCH_DIR) not in sys.path:
-    sys.path.insert(0, str(_LAUNCH_DIR))
-from lidar_mount import LIDAR_PITCH, LIDAR_ROLL, LIDAR_X, LIDAR_Y, LIDAR_YAW, LIDAR_Z
+_LAUNCH_DIR = str(Path(__file__).resolve().parent)
+if _LAUNCH_DIR not in sys.path:
+    sys.path.insert(0, _LAUNCH_DIR)
+from lidar_mount import mount_defaults
 
 
 def generate_launch_description():
@@ -51,12 +51,8 @@ def generate_launch_description():
         DeclareLaunchArgument('base_length', default_value='0.55'),
         DeclareLaunchArgument('base_width', default_value='0.55'),
         DeclareLaunchArgument('base_height', default_value='0.50'),
-        DeclareLaunchArgument('lidar_x', default_value=LIDAR_X),
-        DeclareLaunchArgument('lidar_y', default_value=LIDAR_Y),
-        DeclareLaunchArgument('lidar_z', default_value=LIDAR_Z),
-        DeclareLaunchArgument('lidar_roll', default_value=LIDAR_ROLL),
-        DeclareLaunchArgument('lidar_pitch', default_value=LIDAR_PITCH),
-        DeclareLaunchArgument('lidar_yaw', default_value=LIDAR_YAW),
+        *(DeclareLaunchArgument(name, default_value=value)
+          for name, value in mount_defaults().items()),
 
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(

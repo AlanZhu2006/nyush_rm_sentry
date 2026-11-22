@@ -8,22 +8,29 @@ import struct
 import time
 
 import rclpy
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import Twist, Vector3
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 import serial
 from serial.tools import list_ports
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from sentry_vision_transport import SharedVisionTransport, RELEASE
+from std_msgs.msg import Bool, Float64MultiArray
 
 
 MAGIC = b"\xa5\x5a"
 PROTOCOL_VERSION = 1
 COMMAND_TYPE = 0x01
+GIMBAL_COMMAND_TYPE = 0x02
 TELEMETRY_TYPE = 0x81
+AIM_TELEMETRY_TYPE = 0x82
 COMMAND_ENABLE = 0x01
+STATUS_AIM_YAW_ONLINE = 0x04
+STATUS_AIM_YAW_FEEDBACK_SUPPORTED = 0x40
+STATUS_AIM_YAW_RIGHT_LIMIT = 0x80
 COMMAND_BODY = struct.Struct("<2sBBHhhhB")
 TELEMETRY_BODY = struct.Struct("<2sBBHI4H4hB")
+AIM_TELEMETRY_BODY = struct.Struct("<2sBBHIHfffhB")
 CRC = struct.Struct("<H")
 COMMAND_FRAME_SIZE = COMMAND_BODY.size + CRC.size
 TELEMETRY_FRAME_SIZE = TELEMETRY_BODY.size + CRC.size
@@ -129,9 +136,14 @@ class SentryNav2Bridge(Node):
         self._valid_frame_count = 0
         self._crc_error_count = 0
         self._discarded_byte_count = 0
+        self._last_wrong_firmware_warning = 0.0
+        self._last_motor_status: int | None = None
         self._command_sequence = 0
         self._latest_twist = Twist()
         self._last_twist_monotonic: float | None = None
+        self._emergency_stop = False
+        self._latest_gimbal = Vector3()
+        self._last_gimbal_monotonic: float | None = None
         self._last_telemetry_monotonic: float | None = None
         self._last_mcu_time_ms: int | None = None
         self._last_stale_warning = 0.0
@@ -140,7 +152,21 @@ class SentryNav2Bridge(Node):
         self._yaw = 0.0
 
         self._odom_publisher = self.create_publisher(Odometry, odom_topic, 20)
+        self._aim_yaw_online_publisher = self.create_publisher(
+            Bool, "/sentry/aim_yaw_online", 10
+        )
+        self._aim_yaw_right_limit_publisher = self.create_publisher(
+            Bool, "/sentry/aim_yaw_right_limit", 10
+        )
+        self._aim_yaw_left_limit_publisher = self.create_publisher(
+            Bool, "/sentry/aim_yaw_left_limit", 10
+        )
+        self._aim_yaw_feedback_publisher = self.create_publisher(
+            Float64MultiArray, "/sentry/aim_yaw_feedback", 10
+        )
         self.create_subscription(Twist, command_topic, self._twist_callback, 20)
+        self.create_subscription(Bool, "/emergency_stop", self._emergency_stop_callback, 10)
+        self.create_subscription(Vector3, "/sentry/gimbal_manual", self._gimbal_callback, 20)
         self.create_timer(1.0 / command_rate_hz, self._send_command)
         self.create_timer(0.01, self._read_telemetry)
         self.create_timer(0.5, self._check_telemetry)
@@ -179,6 +205,7 @@ class SentryNav2Bridge(Node):
             connection.close()
             raise RuntimeError(f"Cannot create vision PTY: {error}") from error
         self._last_twist_monotonic = None
+        self._last_gimbal_monotonic = None
         self._serial = connection
         self._serial_port = port
         self._connected_monotonic = now
@@ -186,6 +213,7 @@ class SentryNav2Bridge(Node):
         self._rx_buffer.clear()
         self._last_telemetry_monotonic = None
         self._last_mcu_time_ms = None
+        self._last_motor_status = None
         self.get_logger().info(f"USB controller connected on {port}")
         return True
 
@@ -195,6 +223,7 @@ class SentryNav2Bridge(Node):
         self._vision.output.clear()
         self._vision.active = False
         self._last_twist_monotonic = None
+        self._last_gimbal_monotonic = None
         connection = self._serial
         port = self._serial_port
         self._serial = None
@@ -217,10 +246,23 @@ class SentryNav2Bridge(Node):
         )
 
     def _twist_callback(self, message: Twist) -> None:
-        self._latest_twist = message
-        self._last_twist_monotonic = time.monotonic()
+        if not self._emergency_stop:
+            self._latest_twist = message
+            self._last_twist_monotonic = time.monotonic()
 
-    def _send_command(self) -> None:
+    def _emergency_stop_callback(self, message: Bool) -> None:
+        if message.data == self._emergency_stop:
+            return
+        self._emergency_stop = message.data
+        self._last_twist_monotonic = None
+        if self._emergency_stop and self._serial is not None:
+            self._send_command(chassis_only=True)
+
+    def _gimbal_callback(self, message: Vector3) -> None:
+        self._latest_gimbal = message
+        self._last_gimbal_monotonic = time.monotonic()
+
+    def _send_command(self, *, chassis_only: bool = False) -> None:
         if not hasattr(self, "_vision"):
             # Keep offline diagnostic callers independent of a real PTY.
             self._vision = SharedVisionTransport(None)
@@ -266,6 +308,26 @@ class SentryNav2Bridge(Node):
             return
         try:
             self._vision.tx.put(frame, now, "nav")
+            if not chassis_only:
+                gimbal_fresh = (
+                    self._last_gimbal_monotonic is not None
+                    and now - self._last_gimbal_monotonic <= timeout
+                )
+                gimbal = self._latest_gimbal
+                yaw_rate = float(gimbal.x) if gimbal_fresh else 0.0
+                pitch_rate = float(gimbal.y) if gimbal_fresh else 0.0
+                if not math.isfinite(yaw_rate) or not math.isfinite(pitch_rate):
+                    yaw_rate = pitch_rate = 0.0
+                    gimbal_fresh = False
+                spin = gimbal_fresh and gimbal.z >= 0.5
+                gimbal_body = COMMAND_BODY.pack(
+                    MAGIC, PROTOCOL_VERSION, GIMBAL_COMMAND_TYPE,
+                    self._command_sequence, round(max(-0.60, min(0.60, yaw_rate)) * 1000),
+                    round(max(-0.20, min(0.20, pitch_rate)) * 1000), 0,
+                    (COMMAND_ENABLE if gimbal_fresh else 0) | (0x02 if spin else 0),
+                )
+                gimbal_frame = gimbal_body + CRC.pack(crc16_ccitt(gimbal_body))
+                self._vision.tx.put(gimbal_frame, now, "manual")
             for _ in range(4):
                 self._vision.tx.flush(connection.write, now)
         except (OSError, serial.SerialException, BufferError, TimeoutError) as error:
@@ -294,14 +356,62 @@ class SentryNav2Bridge(Node):
         self._discarded_byte_count = self._vision.parser.discarded
         for kind, frame in frames:
             body = frame[:-CRC.size]
-            if kind != "nav":
+            if body[3] == AIM_TELEMETRY_TYPE:
+                fields = AIM_TELEMETRY_BODY.unpack(body)
+                # Do not refresh online or limit feedback from malformed data.
+                if (fields[5] >= ECD_FULL_RANGE or
+                        (fields[10] & 0xE0 and not fields[10] & 0x10) or
+                        not all(math.isfinite(value) for value in fields[6:9])):
+                    self._discarded_byte_count += TELEMETRY_FRAME_SIZE
+                    continue
+                self._valid_frame_count += 1
+                self._handle_aim_telemetry(fields)
                 continue
+
             fields = TELEMETRY_BODY.unpack(body)
             self._valid_frame_count += 1
             mcu_time_ms = int(fields[4])
             steer_ecd = tuple(int(value) for value in fields[5:9])
             drive_rpm = tuple(int(value) for value in fields[9:13])
+            motor_status = int(fields[13])
+            aim_feedback_supported = bool(
+                motor_status & STATUS_AIM_YAW_FEEDBACK_SUPPORTED
+            )
+            if aim_feedback_supported:
+                # Directional limits require the dedicated two-edge frame.
+                # Older firmware may report online, but cannot permit motion.
+                aim_yaw_online = Bool()
+                aim_yaw_online.data = bool(motor_status & STATUS_AIM_YAW_ONLINE)
+                self._aim_yaw_online_publisher.publish(aim_yaw_online)
+            if motor_status != self._last_motor_status:
+                self._last_motor_status = motor_status
+                online = lambda bit: "yes" if motor_status & bit else "no"
+                aim_yaw_status = (
+                    online(STATUS_AIM_YAW_ONLINE) if aim_feedback_supported else "unknown"
+                )
+                self.get_logger().info(
+                    f"controller: chassis={online(0x01)} aim_yaw_online={aim_yaw_status} "
+                    f"aim_yaw_right_limit={online(STATUS_AIM_YAW_RIGHT_LIMIT)} "
+                    f"lower_yaw_online={online(0x08)} "
+                    f"lower_yaw_enabled={online(0x10)} spin_request={online(0x20)}"
+                )
             self._handle_telemetry(mcu_time_ms, steer_ecd, drive_rpm)
+
+    def _handle_aim_telemetry(self, fields: tuple) -> None:
+        flags = int(fields[10])
+        left_limit = Bool()
+        left_limit.data = bool(flags & 0x02)
+        self._aim_yaw_left_limit_publisher.publish(left_limit)
+        right_limit = Bool()
+        right_limit.data = bool(flags & 0x04)
+        self._aim_yaw_right_limit_publisher.publish(right_limit)
+        online = Bool()
+        online.data = bool(flags & 0x01)
+        self._aim_yaw_online_publisher.publish(online)
+        feedback = Float64MultiArray()
+        # Encoder, actual angle, target angle, speed, output, flags, MCU time.
+        feedback.data = [float(value) for value in (*fields[5:11], fields[4])]
+        self._aim_yaw_feedback_publisher.publish(feedback)
 
     def _handle_telemetry(
         self,
@@ -437,10 +547,22 @@ class SentryNav2Bridge(Node):
                     0,
                 )
                 zero_frame = zero_body + CRC.pack(crc16_ccitt(zero_body))
+                gimbal_zero_body = COMMAND_BODY.pack(
+                    MAGIC,
+                    PROTOCOL_VERSION,
+                    GIMBAL_COMMAND_TYPE,
+                    self._command_sequence,
+                    0,
+                    0,
+                    0,
+                    0,
+                )
+                gimbal_zero_frame = gimbal_zero_body + CRC.pack(crc16_ccitt(gimbal_zero_body))
                 now = time.monotonic()
                 self._vision.tx.cancel_unsent()
                 self._vision.tx.put(RELEASE, now, "vision")
                 self._vision.tx.put(zero_frame, now, "nav")
+                self._vision.tx.put(gimbal_zero_frame, now, "manual")
                 for _ in range(128):
                     if not self._vision.tx.pending or time.monotonic() - now > .05:
                         break

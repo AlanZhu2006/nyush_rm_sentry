@@ -6,11 +6,6 @@ with tempfile.TemporaryDirectory(prefix="sentry-vision-test-") as d:
     subprocess.run(["cc","-std=c11","-Wall","-Wextra","-Werror","-I"+str(root/"application/sentry"),str(root/"scripts/diagnostics/sentry_vision_test.c"),str(root/"application/sentry/sentry_vision.c"),"-lm","-o",str(exe)],check=True)
     subprocess.run([str(exe)],check=True)
 
-other=root.parent/("nyush_rm_sentry_beyblading" if root.name=="nyush_rm_sentry" else "nyush_rm_sentry")
-if other.exists():
-    for name in ("sentry_vision.c", "sentry_vision.h", "sentry_vision_protocol.h"):
-        assert (root/"application/sentry"/name).read_bytes()==(other/"application/sentry"/name).read_bytes(), "firmware helper copies differ: "+name
-
 # Compile the actual legacy UART/VCP validation and stream bodies with tiny I/O
 # doubles; this checks production functions rather than a Python codec copy.
 source=(root/"modules/master_machine/master_process.c").read_text()
@@ -92,7 +87,7 @@ with tempfile.TemporaryDirectory(prefix="sentry-uart-length-") as d:
     subprocess.run([str(exe)],check=True)
 print("production UART short-read length propagation: PASS")
 
-if root.name == "nyush_rm_sentry_beyblading":
+if (root/"application/sentry/sentry_aim_yaw_limit.h").is_file():
     # Compile the actual vision branch of UpdateAimYawMotor with the real robot
     # calibration and encoder-coordinate helper. Motor/RTOS dependencies are
     # replaced only outside this adapter branch.

@@ -1,5 +1,10 @@
 # Sentry gimbal integration status
 
+This document records the original preview-only development stage. The NUC
+deployment procedure and active controls are documented in
+[`ros2_ws/README.md`](../ros2_ws/README.md) and
+[`application/sentry/SENTRY_STEER_NAV2.md`](../application/sentry/SENTRY_STEER_NAV2.md).
+
 The current `sentry_swerve` firmware runs `SentrySteerNav2Task`, which owns the
 USB CDC command stream and the four steering and four drive motors. It does not
 initialize the old `GimbalInit` or `RobotCMDInit` applications. The older sentry

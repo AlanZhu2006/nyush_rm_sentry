@@ -1,8 +1,9 @@
-FAST-LIO/ICP map sets are stored here. The repository includes the latest
-validated `arena` PCD/PGM/YAML set as a reproducible navigation fixture; newly
-generated map names remain ignored until they are deliberately reviewed.
+FAST-LIO/ICP map sets are stored here. `arena` is the previously deployed
+navigation fixture. `arena_nuc` preserves the map set from the original NUC
+working tree. They cover different map coordinates and must be selected as
+complete sets. Newly generated maps remain ignored until deliberately reviewed.
 
-Verify the tracked set with `sha256sum -c SHA256SUMS` from this directory.
+Verify both tracked sets with `sha256sum -c SHA256SUMS` from this directory.
 
 Create and save a map named `arena` with the chassis on level ground:
 
@@ -10,8 +11,9 @@ Create and save a map named `arena` with the chassis on level ground:
   # Ctrl-C in that terminal saves PCD + PGM/YAML. `just map-save arena`
   # still works if you want a snapshot without stopping mapping.
 
-FAST-LIO now gravity-aligns `camera_init`. Maps recorded before that change
-cannot be mixed with a gravity-aligned live cloud; remap after updating.
+FAST-LIO gravity-aligns `camera_init`. Verify the ground orientation and
+landmark alignment against the current sensor mount before driving on a saved
+map. Rebuild the map if its original frame is incompatible.
 
 The resulting `arena.pcd`, `arena.pgm`, and `arena.yaml` must stay together.
 The PCD is used by ICP localization; the PGM/YAML pair is used by Nav2.

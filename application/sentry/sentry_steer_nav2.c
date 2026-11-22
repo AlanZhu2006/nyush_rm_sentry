@@ -7,10 +7,13 @@
 #include "bsp_log.h"
 #include "bsp_usb.h"
 #include "dji_motor.h"
+#include "dmmotor.h"
 #include "general_def.h"
 #include "led.h"
 #include "message_center.h"
 #include "robot_def.h"
+#include "sentry_aim_yaw_limit.h"
+#include "sentry_aim_yaw_profile.h"
 #include "task.h"
 
 #include <math.h>
@@ -42,12 +45,48 @@ typedef enum
 #define NAV2_PROTOCOL_MAGIC_1 0x5au
 #define NAV2_PROTOCOL_VERSION 1u
 #define NAV2_COMMAND_TYPE 0x01u
+#define AIM_COMMAND_TYPE 0x02u
 #define NAV2_TELEMETRY_TYPE 0x81u
+#define AIM_TELEMETRY_TYPE 0x82u
 #define NAV2_COMMAND_FRAME_SIZE 15u
 #define NAV2_TELEMETRY_FRAME_SIZE 29u
 #define NAV2_COMMAND_ENABLE_FLAG 0x01u
 #define NAV2_STATUS_CONTROL_ENABLED 0x01u
 #define NAV2_STATUS_COMMAND_FRESH 0x02u
+#define NAV2_STATUS_AIM_YAW_ONLINE 0x04u
+#define NAV2_STATUS_LOWER_YAW_ONLINE 0x08u
+#define NAV2_STATUS_LOWER_YAW_ENABLED 0x10u
+#define NAV2_STATUS_LOWER_SPIN_REQUEST 0x20u
+#define NAV2_STATUS_AIM_YAW_FEEDBACK_SUPPORTED 0x40u
+#define NAV2_STATUS_AIM_YAW_RIGHT_LIMIT 0x80u
+/* Manual yaw is left-positive; SP yaw is right-positive. */
+#define AIM_YAW_SP_COMMAND_SIGN (-SENTRY_AIM_YAW_COMMAND_SIGN)
+#define AIM_YAW_RIGHT_GUARD_DEG \
+    ((float)SENTRY_AIM_YAW_RIGHT_GUARD_ECD * (360.0f / 8192.0f))
+#define AIM_YAW_LEFT_TRAVEL_DEG \
+    ((float)(SENTRY_AIM_YAW_TRAVEL_ECD - SENTRY_AIM_YAW_LEFT_GUARD_ECD) * (360.0f / 8192.0f))
+#define AIM_YAW_LIMIT_TOLERANCE_DEG \
+    ((float)SENTRY_AIM_YAW_LIMIT_TOLERANCE_ECD * (360.0f / 8192.0f))
+#define AIM_YAW_LIMIT_RELEASE_DEG \
+    ((float)SENTRY_AIM_YAW_LIMIT_RELEASE_ECD * (360.0f / 8192.0f))
+
+#if SENTRY_AIM_YAW_RIGHT_LIMIT_ECD >= 8192u || SENTRY_AIM_YAW_LEFT_LIMIT_ECD >= 8192u
+#error "Aiming yaw limits must be valid single-turn encoder positions"
+#endif
+#if SENTRY_AIM_YAW_TRAVEL_ECD >= 4096u || \
+    SENTRY_AIM_YAW_TRAVEL_ECD <= (SENTRY_AIM_YAW_LEFT_GUARD_ECD + SENTRY_AIM_YAW_RIGHT_GUARD_ECD)
+#error "Aiming yaw span must exceed both guards and remain less than 180 degrees"
+#endif
+#if SENTRY_AIM_YAW_LIMIT_RELEASE_ECD <= SENTRY_AIM_YAW_LIMIT_TOLERANCE_ECD || \
+    (SENTRY_AIM_YAW_TRAVEL_ECD - SENTRY_AIM_YAW_LEFT_GUARD_ECD - SENTRY_AIM_YAW_RIGHT_GUARD_ECD) <= \
+        (2u * SENTRY_AIM_YAW_LIMIT_RELEASE_ECD)
+#error "Aiming yaw limit release margin must exceed tolerance and fit within travel"
+#endif
+#if SENTRY_AIM_YAW_COMMAND_SIGN != -1 && SENTRY_AIM_YAW_COMMAND_SIGN != 1
+#error "Aiming yaw command sign must be -1 or +1"
+#endif
+_Static_assert(GIMBAL_YAW_MOTOR_REVERSE == MOTOR_DIRECTION_NORMAL,
+               "Aiming yaw limits require normal encoder-feedback polarity");
 
 #if CHASSIS_STEER_NAV2_FLIP_EXIT_ECD >= DJI_ECD_QUARTER_RANGE || \
     CHASSIS_STEER_NAV2_FLIP_ENTER_ECD <= DJI_ECD_QUARTER_RANGE
@@ -81,10 +120,41 @@ typedef enum
 
 static DJIMotorInstance *steer_motors[SENTRY_STEER_NAV2_MOTOR_COUNT];
 static DJIMotorInstance *drive_motors[SENTRY_STEER_NAV2_MOTOR_COUNT];
+static DJIMotorInstance *aim_yaw_motor;
+static DMMotorInstance *lower_yaw_motor;
+static uint8_t lower_yaw_spinning;
+static uint8_t lower_yaw_last_online = 2u;
+static uint8_t lower_yaw_last_request = 2u;
+#if SENTRY_AIM_PITCH_ENABLED
+static DJIMotorInstance *aim_pitch_motor;
+#endif
+static volatile int16_t rx_aim_yaw_mrad_s;
+static volatile int16_t rx_aim_pitch_mrad_s;
+static volatile uint8_t rx_aim_enable;
+static volatile uint8_t rx_lower_spin_request;
+static volatile uint16_t rx_aim_sequence;
+static uint16_t handled_aim_sequence;
+static uint32_t last_aim_command_ms;
+static uint32_t last_aim_update_ms;
+static float aim_yaw_origin_deg;
+static float aim_yaw_target_deg;
+static float aim_yaw_profile_rate_deg_s;
+static float aim_yaw_speed_feedforward_deg_s;
+static uint8_t aim_yaw_origin_valid;
+static uint8_t aim_yaw_active;
+static volatile SentryYawLimitFlags_s aim_yaw_limit_flags;
+static uint8_t aim_yaw_last_online = 2u;
+#if SENTRY_AIM_PITCH_ENABLED
+static float aim_pitch_origin_deg;
+static float aim_pitch_target_deg;
+static uint8_t aim_pitch_origin_valid;
+static uint8_t aim_pitch_active;
+#endif
 static float target_total_angle_deg[SENTRY_STEER_NAV2_MOTOR_COUNT];
 static float drive_target_rpm[SENTRY_STEER_NAV2_MOTOR_COUNT];
 static float applied_drive_target_rpm[SENTRY_STEER_NAV2_MOTOR_COUNT];
 static uint8_t *usb_rx_buffer;
+static void UpdateVisionLink(uint32_t now_ms, uint8_t manual);
 static SentryVisionStream_s vision_stream;
 static SentryVisionState_s vision_state;
 static SentryVisionFeedback_s vision_feedback;
@@ -125,6 +195,7 @@ static float slewed_vy_mm_s;
 static float slewed_wz_mrad_s;
 static Publisher_t *dashboard_pub;
 static SentrySteerNav2Telemetry_s dashboard_telemetry;
+static float ClampFloat(float value, float min_value, float max_value);
 
 volatile SentrySteerNav2State_s sentry_steer_nav2_state;
 
@@ -231,6 +302,15 @@ static uint16_t WrapEcdTarget(int32_t target_ecd)
     return (uint16_t)target_ecd;
 }
 
+static uint8_t AimMotorOnline(const DJIMotorInstance *motor)
+{
+    /* feed_cnt is a DWT timestamp and can be zero after debugger detach.
+       Receipt of a full CAN feedback frame is independent of that clock. */
+    return motor != NULL && motor->motor_can_instance != NULL &&
+           motor->motor_can_instance->rx_len == 8u &&
+           DaemonIsOnline(motor->daemon);
+}
+
 static uint8_t MotorOnlineBitmap(DJIMotorInstance *const motors[SENTRY_STEER_NAV2_MOTOR_COUNT])
 {
     uint8_t bitmap = 0u;
@@ -291,6 +371,23 @@ static void PublishDashboardTelemetry(uint8_t command_fresh)
     dashboard_telemetry.flip_bitmap = drive_flip_bitmap;
     dashboard_telemetry.control_enabled = sentry_steer_nav2_state.control_enabled;
     dashboard_telemetry.command_fresh = command_fresh;
+
+    taskENTER_CRITICAL();
+    dashboard_telemetry.aim_yaw_online = AimMotorOnline(aim_yaw_motor);
+    dashboard_telemetry.aim_yaw_active = aim_yaw_active;
+    dashboard_telemetry.aim_yaw_left_limit = aim_yaw_limit_flags.at_left_limit;
+    dashboard_telemetry.aim_yaw_right_limit = aim_yaw_limit_flags.at_right_limit;
+    dashboard_telemetry.aim_yaw_target_deg = aim_yaw_target_deg;
+    if (aim_yaw_motor != NULL)
+    {
+        dashboard_telemetry.aim_yaw_actual_deg = aim_yaw_motor->measure.total_angle;
+        dashboard_telemetry.aim_yaw_actual_speed_deg_s = aim_yaw_motor->measure.speed_aps;
+        dashboard_telemetry.aim_yaw_encoder_raw = aim_yaw_motor->measure.ecd;
+        dashboard_telemetry.aim_yaw_target_speed_deg_s = aim_yaw_active
+            ? aim_yaw_motor->motor_controller.angle_PID.Output + aim_yaw_speed_feedforward_deg_s
+            : 0.0f;
+    }
+    taskEXIT_CRITICAL();
 
     for (uint8_t i = 0u; i < SENTRY_STEER_NAV2_MOTOR_COUNT; ++i)
     {
@@ -529,8 +626,20 @@ static void DecodeCommandFrame(const uint8_t *frame)
     const uint16_t received_crc = (uint16_t)frame[NAV2_COMMAND_FRAME_SIZE - 2u] |
                                   ((uint16_t)frame[NAV2_COMMAND_FRAME_SIZE - 1u] << 8);
 
-    if (frame[2] != NAV2_PROTOCOL_VERSION || frame[3] != NAV2_COMMAND_TYPE ||
+    if (frame[2] != NAV2_PROTOCOL_VERSION ||
         ProtocolCrc16(frame, NAV2_COMMAND_FRAME_SIZE - 2u) != received_crc)
+        return;
+
+    if (frame[3] == AIM_COMMAND_TYPE)
+    {
+        rx_aim_yaw_mrad_s = ReadI16Le(&frame[6]);
+        rx_aim_pitch_mrad_s = ReadI16Le(&frame[8]);
+        rx_aim_enable = frame[12] & NAV2_COMMAND_ENABLE_FLAG;
+        rx_lower_spin_request = frame[12] & 0x02u;
+        rx_aim_sequence = (uint16_t)(rx_aim_sequence + 1u);
+        return;
+    }
+    if (frame[3] != NAV2_COMMAND_TYPE)
         return;
 
     rx_vx_mm_s = ReadI16Le(&frame[6]);
@@ -538,6 +647,273 @@ static void DecodeCommandFrame(const uint8_t *frame)
     rx_wz_mrad_s = ReadI16Le(&frame[10]);
     rx_enable = frame[12] & NAV2_COMMAND_ENABLE_FLAG;
     rx_sequence = (uint16_t)(rx_sequence + 1u);
+}
+
+static void UpdateAimYawLimitFlags(uint16_t ecd)
+{
+    const float relative = SentryYawRelativeDeg(ecd, SENTRY_AIM_YAW_RIGHT_LIMIT_ECD);
+    taskENTER_CRITICAL();
+    const SentryYawLimitFlags_s previous = aim_yaw_limit_flags;
+    aim_yaw_limit_flags = SentryYawUpdateLimitFlags(
+        relative, AIM_YAW_LEFT_TRAVEL_DEG, AIM_YAW_RIGHT_GUARD_DEG,
+        AIM_YAW_LIMIT_TOLERANCE_DEG, AIM_YAW_LIMIT_RELEASE_DEG, previous);
+    taskEXIT_CRITICAL();
+}
+
+static uint8_t AimYawAtRightLimit(void)
+{
+    if (!AimMotorOnline(aim_yaw_motor))
+        return 0u;
+    return aim_yaw_limit_flags.at_right_limit;
+}
+
+static uint8_t AimYawAtLeftLimit(void)
+{
+    if (!AimMotorOnline(aim_yaw_motor))
+        return 0u;
+    return aim_yaw_limit_flags.at_left_limit;
+}
+
+static void LimitAimYawOutput(void)
+{
+    if (aim_yaw_motor == NULL)
+        return;
+    if (!AimMotorOnline(aim_yaw_motor))
+    {
+        aim_yaw_motor->motor_controller.pre_current_ref = 0.0f;
+        return;
+    }
+    const float relative = SentryYawRelativeDeg(aim_yaw_motor->measure.ecd,
+                                               SENTRY_AIM_YAW_RIGHT_LIMIT_ECD);
+    UpdateAimYawLimitFlags(aim_yaw_motor->measure.ecd);
+    /* This motor uses angle/speed loops with normal output polarity. The
+       existing pre-current hook therefore clips the actual outgoing command,
+       including speed-PI integral that survives an approach to the edge. */
+    aim_yaw_motor->motor_controller.pre_current_ref = SentryYawClampOutput(
+        aim_yaw_motor->motor_controller.pre_current_ref, relative,
+        AIM_YAW_LEFT_TRAVEL_DEG, AIM_YAW_RIGHT_GUARD_DEG);
+    const float output = aim_yaw_motor->motor_controller.pre_current_ref;
+    if ((aim_yaw_limit_flags.at_left_limit && output < 0.0f) ||
+        (aim_yaw_limit_flags.at_right_limit && output > 0.0f))
+        aim_yaw_motor->motor_controller.pre_current_ref = 0.0f;
+}
+
+static void UpdateAimYawMotor(float dt_s, uint8_t enabled)
+{
+    if (!AimMotorOnline(aim_yaw_motor))
+    {
+        taskENTER_CRITICAL();
+        if (aim_yaw_motor != NULL)
+            DJIMotorStop(aim_yaw_motor);
+        aim_yaw_speed_feedforward_deg_s = 0.0f;
+        aim_yaw_profile_rate_deg_s = 0.0f;
+        aim_yaw_active = 0u;
+        taskEXIT_CRITICAL();
+        return;
+    }
+
+    taskENTER_CRITICAL();
+    const uint16_t ecd = aim_yaw_motor->measure.ecd;
+    const float current = aim_yaw_motor->measure.total_angle;
+    taskEXIT_CRITICAL();
+    const float relative = SentryYawRelativeDeg(ecd, SENTRY_AIM_YAW_RIGHT_LIMIT_ECD);
+    aim_yaw_origin_deg = current - relative;
+    aim_yaw_origin_valid = isfinite(relative);
+    UpdateAimYawLimitFlags(ecd);
+
+    const float previous_target = aim_yaw_active ? aim_yaw_target_deg : current;
+    float motor_rate = (float)rx_aim_yaw_mrad_s * (float)SENTRY_AIM_YAW_COMMAND_SIGN;
+    if (vision_state.active)
+    {
+        float requested_rate = 0.0f;
+        const uint32_t vision_now = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+        if (!SentryVisionYawRate(&vision_state, &vision_feedback, relative,
+                                -AIM_YAW_LEFT_TRAVEL_DEG, -AIM_YAW_RIGHT_GUARD_DEG,
+                                AIM_YAW_SP_COMMAND_SIGN,
+                                SENTRY_AIM_YAW_MAX_RATE_MRAD_S * .001f,
+                                vision_now, &requested_rate))
+        {
+            vision_state.active = 0u;
+            vision_state.seen = 0u;
+            vision_state.flags = (vision_state.flags & (uint8_t)~SENTRY_VISION_ACTIVE) |
+                                  SENTRY_VISION_REJECTED;
+            ++vision_state.rejected_count;
+            enabled = 0u;
+        }
+        motor_rate = requested_rate * 1000.0f;
+    }
+    const SentryYawProfileResult_s profile = SentryYawProfileStep(
+        motor_rate * 0.001f * RAD_2_DEGREE, aim_yaw_profile_rate_deg_s,
+        relative, previous_target - aim_yaw_origin_deg,
+        AIM_YAW_LEFT_TRAVEL_DEG, AIM_YAW_RIGHT_GUARD_DEG,
+        SENTRY_AIM_YAW_MAX_RATE_MRAD_S * 0.001f * RAD_2_DEGREE,
+        SENTRY_AIM_YAW_ACCEL_RAD_S2 * RAD_2_DEGREE,
+        SENTRY_AIM_YAW_BRAKE_RAD_S2 * RAD_2_DEGREE, dt_s,
+        aim_yaw_limit_flags.at_left_limit, aim_yaw_limit_flags.at_right_limit);
+    const float logical_rate = profile.rate_deg_s * DEGREE_2_RAD * 1000.0f *
+                               (float)SENTRY_AIM_YAW_COMMAND_SIGN;
+    const SentryYawLimitResult_s limited = SentryYawLimitStep(
+        ecd, SENTRY_AIM_YAW_RIGHT_LIMIT_ECD, current, aim_yaw_target_deg,
+        logical_rate, SENTRY_AIM_YAW_COMMAND_SIGN,
+        AIM_YAW_LEFT_TRAVEL_DEG, AIM_YAW_RIGHT_GUARD_DEG, dt_s, aim_yaw_active);
+    const uint8_t blocked =
+        (aim_yaw_limit_flags.at_left_limit && motor_rate <= 0.0f) ||
+        (aim_yaw_limit_flags.at_right_limit && motor_rate >= 0.0f);
+    if (!enabled || !profile.valid || !limited.enabled || blocked)
+    {
+        taskENTER_CRITICAL();
+        DJIMotorStop(aim_yaw_motor);
+        if (aim_yaw_active)
+            ResetMotorController(aim_yaw_motor);
+        aim_yaw_speed_feedforward_deg_s = 0.0f;
+        aim_yaw_profile_rate_deg_s = 0.0f;
+        aim_yaw_active = 0u;
+        aim_yaw_target_deg = current;
+        DJIMotorSetRef(aim_yaw_motor, current);
+        taskEXIT_CRITICAL();
+        return;
+    }
+    /* Feed the velocity of the actual limited target, including edge clipping,
+       rather than a raw key rate. Publish it with the target before motorTask. */
+    const float max_target_rate = SENTRY_AIM_YAW_MAX_RATE_MRAD_S * 0.001f * RAD_2_DEGREE;
+    const float feedforward = ClampFloat((limited.target_deg - previous_target) / dt_s,
+                                        -max_target_rate, max_target_rate) *
+                              SENTRY_AIM_YAW_SPEED_FEEDFORWARD_GAIN;
+    taskENTER_CRITICAL();
+    if (!aim_yaw_active)
+        ResetMotorController(aim_yaw_motor);
+    aim_yaw_speed_feedforward_deg_s = feedforward;
+    aim_yaw_profile_rate_deg_s = profile.rate_deg_s;
+    aim_yaw_target_deg = limited.target_deg;
+    aim_yaw_active = 1u;
+    DJIMotorSetRef(aim_yaw_motor, aim_yaw_target_deg);
+    DJIMotorEnable(aim_yaw_motor);
+    taskEXIT_CRITICAL();
+}
+
+#if SENTRY_AIM_PITCH_ENABLED
+static void UpdateAimMotor(DJIMotorInstance *motor, float *origin_deg,
+                           float *target_deg, uint8_t *origin_valid, uint8_t *active,
+                           int16_t rate_mrad_s, float travel_deg, float dt_s,
+                           uint8_t enabled)
+{
+    if (!AimMotorOnline(motor))
+    {
+        if (motor != NULL)
+            DJIMotorStop(motor);
+        *active = 0u;
+        return;
+    }
+    if (!*origin_valid)
+    {
+        *origin_deg = motor->measure.total_angle;
+        *target_deg = *origin_deg;
+        *origin_valid = 1u;
+    }
+    if (!enabled)
+    {
+        DJIMotorStop(motor);
+        *active = 0u;
+        return;
+    }
+    if (!*active)
+    {
+        const float angle = motor->measure.total_angle;
+        if (angle < *origin_deg - travel_deg || angle > *origin_deg + travel_deg)
+        {
+            DJIMotorStop(motor);
+            return;
+        }
+        taskENTER_CRITICAL();
+        ResetMotorController(motor);
+        taskEXIT_CRITICAL();
+        *target_deg = angle;
+        *active = 1u;
+    }
+    const float rate = ClampFloat((float)rate_mrad_s, -300.0f, 300.0f);
+    *target_deg = ClampFloat(*target_deg + rate * 0.001f * RAD_2_DEGREE * dt_s,
+                             *origin_deg - travel_deg, *origin_deg + travel_deg);
+    DJIMotorSetRef(motor, *target_deg);
+    DJIMotorEnable(motor);
+}
+#endif
+
+static void UpdateManualAim(uint32_t now_ms)
+{
+    const uint8_t yaw_online = AimMotorOnline(aim_yaw_motor);
+    if (yaw_online != aim_yaw_last_online)
+    {
+        aim_yaw_last_online = yaw_online;
+        if (yaw_online)
+            LOGINFO("[steer-nav2] aiming yaw online");
+        else
+            LOGWARNING("[steer-nav2] aiming yaw offline");
+    }
+    if (handled_aim_sequence != rx_aim_sequence)
+    {
+        handled_aim_sequence = rx_aim_sequence;
+        last_aim_command_ms = now_ms;
+    }
+    const uint8_t enabled = rx_aim_enable &&
+        (now_ms - last_aim_command_ms) <= SENTRY_AIM_COMMAND_TIMEOUT_MS;
+    float dt_s = 0.005f;
+    if (last_aim_update_ms != 0u)
+        dt_s = ClampFloat((float)(now_ms - last_aim_update_ms) * 0.001f,
+                          0.0f, 0.05f);
+    last_aim_update_ms = now_ms;
+    const uint8_t manual_active = enabled &&
+        (rx_aim_yaw_mrad_s != 0 || rx_aim_pitch_mrad_s != 0 || rx_lower_spin_request);
+    UpdateVisionLink(now_ms, manual_active);
+    UpdateAimYawMotor(dt_s, enabled || vision_state.active);
+#if SENTRY_AIM_PITCH_ENABLED
+    UpdateAimMotor(aim_pitch_motor, &aim_pitch_origin_deg, &aim_pitch_target_deg,
+                   &aim_pitch_origin_valid, &aim_pitch_active, rx_aim_pitch_mrad_s,
+                   SENTRY_AIM_PITCH_TRAVEL_DEG, dt_s, enabled);
+#endif
+    if (lower_yaw_motor == NULL)
+        return;
+
+    const uint8_t lower_online = DMMotorIsOnline(lower_yaw_motor);
+    const uint8_t lower_request = enabled && rx_lower_spin_request;
+    if (lower_online != lower_yaw_last_online)
+    {
+        lower_yaw_last_online = lower_online;
+        if (lower_online)
+            LOGINFO("[steer-nav2] lower yaw online");
+        else
+            LOGWARNING("[steer-nav2] lower yaw offline");
+    }
+    if (lower_request != lower_yaw_last_request)
+    {
+        lower_yaw_last_request = lower_request;
+        LOGINFO("[steer-nav2] lower yaw spin request=%u",
+                (unsigned int)lower_request);
+    }
+
+    if (!enabled)
+    {
+        DMMotorStop(lower_yaw_motor);
+        lower_yaw_spinning = 0u;
+        return;
+    }
+
+    if (rx_lower_spin_request)
+    {
+        DMMotorEnable(lower_yaw_motor);
+        DMMotorSetRef(lower_yaw_motor,
+                      lower_online && DMMotorIsEnabled(lower_yaw_motor) ?
+                          SENTRY_LOWER_YAW_SPIN_RAD_S : 0.0f);
+        lower_yaw_spinning = 1u;
+    }
+    else if (lower_yaw_spinning)
+    {
+        DMMotorSetRef(lower_yaw_motor, 0.0f);
+        if (!lower_online || fabsf(lower_yaw_motor->measure.velocity) < 0.15f)
+        {
+            DMMotorStop(lower_yaw_motor);
+            lower_yaw_spinning = 0u;
+        }
+    }
 }
 
 static void MixedCommandFrame(void *context, const uint8_t *frame, size_t length)
@@ -563,9 +939,11 @@ static void UpdateVisionLink(uint32_t now_ms, uint8_t manual)
     SentryVisionFeedback_s sample = {0};
     if (!SentryVisionReadFeedback(&sample))
         memset(&sample, 0, sizeof(sample));
-    /* This configuration registers chassis motors only. */
-    sample.capabilities &= (SENTRY_VISION_ATTITUDE | SENTRY_VISION_BULLET_SPEED |
-                            SENTRY_VISION_BULLET_COUNT);
+    /* Only guarded yaw exists here; pitch/shooting are not initialized. */
+    sample.capabilities &= (SENTRY_VISION_YAW | SENTRY_VISION_ATTITUDE |
+                            SENTRY_VISION_BULLET_SPEED | SENTRY_VISION_BULLET_COUNT);
+    if (!AimMotorOnline(aim_yaw_motor))
+        sample.capabilities &= (uint8_t)~SENTRY_VISION_YAW;
     vision_feedback = sample;
     uint8_t frame[SENTRY_VISION_COMMAND_SIZE];
     uint32_t received_ms = 0u;
@@ -690,21 +1068,9 @@ static void CalculateSwerveTargets(float vx_mm_s, float vy_mm_s, float wz_mrad_s
 
     for (uint8_t i = 0u; i < SENTRY_STEER_NAV2_MOTOR_COUNT; ++i)
     {
-        float module_vx = vx_mm_s - wz_rad_s * module_y_mm[i];
+        const float module_vx = vx_mm_s - wz_rad_s * module_y_mm[i];
         const float module_vy_left = vy_mm_s + wz_rad_s * module_x_mm[i];
-        float module_vy_right = -module_vy_left;
-
-        /* Recaptured zeros are ~90 deg from the previous set, so the same
-         * ICR diamond is scheme 2 in the chassis. Rotate yaw-only velocity
-         * +90 deg to restore the previous scheme-1 小陀螺. W/A/S/D keep
-         * the new mechanical forward. */
-        if (translation_speed < CHASSIS_STEER_NAV2_STOP_TRANSLATION_MM_S)
-        {
-            const float vx_rot = -module_vy_right;
-            const float vy_rot = module_vx;
-            module_vx = vx_rot;
-            module_vy_right = vy_rot;
-        }
+        const float module_vy_right = -module_vy_left;
 
         wheel_speed_mm_s[i] = sqrtf(module_vx * module_vx +
                                     module_vy_right * module_vy_right);
@@ -880,8 +1246,11 @@ static void RecordTelemetryRecovery(uint32_t now_ms, const char *reason)
 
 static void SendTelemetry(uint32_t now_ms, uint8_t command_fresh)
 {
-    static uint8_t frame[NAV2_TELEMETRY_FRAME_SIZE + SENTRY_VISION_TELEMETRY_SIZE + SENTRY_VISION_STATUS_SIZE];
-    uint8_t status = 0u;
+    /* Two CRC-protected 29-byte frames fit in one USB FS packet. The original
+       chassis frame stays compatible; type 0x82 adds both yaw limits and
+       motion diagnostics without repurposing its already-full status byte. */
+    static uint8_t frame[2u * NAV2_TELEMETRY_FRAME_SIZE + SENTRY_VISION_TELEMETRY_SIZE + SENTRY_VISION_STATUS_SIZE];
+    uint8_t status = NAV2_STATUS_AIM_YAW_FEEDBACK_SUPPORTED;
     uint8_t transmit_result;
 
     if ((now_ms - last_telemetry_ms) < CHASSIS_STEER_NAV2_TELEMETRY_PERIOD_MS)
@@ -909,6 +1278,17 @@ static void SendTelemetry(uint32_t now_ms, uint8_t command_fresh)
         status |= NAV2_STATUS_CONTROL_ENABLED;
     if (command_fresh)
         status |= NAV2_STATUS_COMMAND_FRESH;
+    if (AimMotorOnline(aim_yaw_motor))
+        status |= NAV2_STATUS_AIM_YAW_ONLINE;
+    if (AimYawAtRightLimit())
+        status |= NAV2_STATUS_AIM_YAW_RIGHT_LIMIT;
+    if (DMMotorIsOnline(lower_yaw_motor))
+        status |= NAV2_STATUS_LOWER_YAW_ONLINE;
+    if (DMMotorIsEnabled(lower_yaw_motor))
+        status |= NAV2_STATUS_LOWER_YAW_ENABLED;
+    if (rx_lower_spin_request && rx_aim_enable &&
+        (now_ms - last_aim_command_ms) <= SENTRY_AIM_COMMAND_TIMEOUT_MS)
+        status |= NAV2_STATUS_LOWER_SPIN_REQUEST;
 
     frame[0] = NAV2_PROTOCOL_MAGIC_0;
     frame[1] = NAV2_PROTOCOL_MAGIC_1;
@@ -923,9 +1303,39 @@ static void SendTelemetry(uint32_t now_ms, uint8_t command_fresh)
     frame[26] = status;
     WriteU16Le(&frame[27], ProtocolCrc16(frame, NAV2_TELEMETRY_FRAME_SIZE - 2u));
 
-    SentryVisionEncodeTelemetry(&vision_state, &vision_feedback, &frame[NAV2_TELEMETRY_FRAME_SIZE]);
+    uint8_t *aim_frame = &frame[NAV2_TELEMETRY_FRAME_SIZE];
+    aim_frame[0] = NAV2_PROTOCOL_MAGIC_0;
+    aim_frame[1] = NAV2_PROTOCOL_MAGIC_1;
+    aim_frame[2] = NAV2_PROTOCOL_VERSION;
+    aim_frame[3] = AIM_TELEMETRY_TYPE;
+    WriteU16Le(&aim_frame[4], telemetry_sequence);
+    WriteU32Le(&aim_frame[6], now_ms);
+    taskENTER_CRITICAL();
+    if (aim_yaw_motor != NULL)
+    {
+        WriteU16Le(&aim_frame[10], aim_yaw_motor->measure.ecd);
+        /* STM32H723 and the wire format both use little-endian IEEE754 floats. */
+        memcpy(&aim_frame[12], &aim_yaw_motor->measure.total_angle, sizeof(float));
+        memcpy(&aim_frame[16], &aim_yaw_target_deg, sizeof(float));
+        memcpy(&aim_frame[20], &aim_yaw_motor->measure.speed_aps, sizeof(float));
+        const float output = aim_yaw_active ? aim_yaw_motor->motor_controller.pre_current_ref : 0.0f;
+        WriteU16Le(&aim_frame[24], (uint16_t)(int16_t)
+                   (isfinite(output) ? ClampFloat(output, -32767.0f, 32767.0f) : 0.0f));
+    }
+    aim_frame[26] = (AimMotorOnline(aim_yaw_motor) ? 0x01u : 0u) |
+                    (AimYawAtLeftLimit() ? 0x02u : 0u) |
+                    (AimYawAtRightLimit() ? 0x04u : 0u) |
+                    (aim_yaw_active ? 0x08u : 0u) |
+                    0x10u | /* Chassis readiness reporting is supported. */
+                    (sentry_steer_nav2_state.steer_online_bitmap == STEER_ALL_ONLINE_BITMAP ? 0x20u : 0u) |
+                    (sentry_steer_nav2_state.drive_online_bitmap == STEER_ALL_ONLINE_BITMAP ? 0x40u : 0u) |
+                    (sentry_steer_nav2_state.control_enabled ? 0x80u : 0u);
+    taskEXIT_CRITICAL();
+    WriteU16Le(&aim_frame[27], ProtocolCrc16(aim_frame, NAV2_TELEMETRY_FRAME_SIZE - 2u));
+
+    SentryVisionEncodeTelemetry(&vision_state, &vision_feedback, &frame[2u * NAV2_TELEMETRY_FRAME_SIZE]);
     SentryVisionEncodeStatus(&vision_state, &vision_feedback,
-                             &frame[NAV2_TELEMETRY_FRAME_SIZE + SENTRY_VISION_TELEMETRY_SIZE]);
+                             &frame[2u * NAV2_TELEMETRY_FRAME_SIZE + SENTRY_VISION_TELEMETRY_SIZE]);
 
     /* Set the flag before submission so an immediate completion interrupt
        cannot race with the task and leave a false pending state behind. */
@@ -993,23 +1403,50 @@ static void LogNav2State(uint32_t now_ms, uint8_t command_fresh)
             LogicalDriveMotorRpm(STEER_NAV2_LR),
             LogicalDriveMotorRpm(STEER_NAV2_RR));
 
-    {
-        CAN_Debug_Info_s can1_debug;
-        CAN_Debug_Info_s can2_debug;
-        CANGetDebugInfo(&hfdcan1, &can1_debug);
-        CANGetDebugInfo(&hfdcan2, &can2_debug);
-        LOGINFO("[steer-nav2] fdcan1 PSR=0x%08lx ECR=0x%08lx fdcan2 PSR=0x%08lx ECR=0x%08lx online=0x%x/0x%x",
-                (unsigned long)can1_debug.msr,
-                (unsigned long)can1_debug.esr,
-                (unsigned long)can2_debug.msr,
-                (unsigned long)can2_debug.esr,
-                sentry_steer_nav2_state.steer_online_bitmap,
-                sentry_steer_nav2_state.drive_online_bitmap);
-    }
+    CAN_Debug_Info_s can1_debug;
+    CAN_Debug_Info_s can2_debug;
+    CANGetDebugInfo(&hfdcan1, &can1_debug);
+    CANGetDebugInfo(&hfdcan2, &can2_debug);
+    LOGINFO("[steer-nav2] fdcan1 PSR=0x%08lx ECR=0x%08lx fdcan2 PSR=0x%08lx ECR=0x%08lx online=0x%x/0x%x",
+            (unsigned long)can1_debug.msr,
+            (unsigned long)can1_debug.esr,
+            (unsigned long)can2_debug.msr,
+            (unsigned long)can2_debug.esr,
+            sentry_steer_nav2_state.steer_online_bitmap,
+            sentry_steer_nav2_state.drive_online_bitmap);
 }
 
 void SentrySteerNav2Init(void)
 {
+    Motor_Init_Config_s aim_config = {
+        .can_init_config.can_handle = &SENTRY_AIM_YAW_CAN_BUS,
+        .can_init_config.tx_id = SENTRY_AIM_YAW_MOTOR_ID,
+        .controller_param_init_config = {
+            .angle_PID = {
+                .Kp = GIMBAL_YAW_ANGLE_PID_KP,
+                .DeadBand = SENTRY_AIM_YAW_ANGLE_DEADBAND_DEG,
+                .MaxOut = 120.0f,
+            },
+            .speed_PID = {
+                .Kp = SENTRY_AIM_YAW_SPEED_PID_KP,
+                .Ki = SENTRY_AIM_YAW_SPEED_PID_KI,
+                .IntegralLimit = SENTRY_AIM_YAW_SPEED_PID_INT_LIMIT,
+                .MaxOut = 6000.0f,
+                .Improve = PID_Integral_Limit,
+            },
+            .speed_feedforward_ptr = &aim_yaw_speed_feedforward_deg_s,
+        },
+        .controller_setting_init_config = {
+            .angle_feedback_source = MOTOR_FEED,
+            .speed_feedback_source = MOTOR_FEED,
+            .outer_loop_type = ANGLE_LOOP,
+            .close_loop_type = ANGLE_LOOP | SPEED_LOOP,
+            .motor_reverse_flag = GIMBAL_YAW_MOTOR_REVERSE,
+            .feedback_reverse_flag = FEEDBACK_DIRECTION_NORMAL,
+            .feedforward_flag = SPEED_FEEDFORWARD,
+        },
+        .motor_type = GM6020,
+    };
     Motor_Init_Config_s steer_config = {
         .can_init_config.can_handle = NULL,
         .controller_param_init_config = {
@@ -1094,6 +1531,70 @@ void SentrySteerNav2Init(void)
         DJIMotorStop(drive_motors[i]);
     }
 
+    aim_yaw_motor = DJIMotorInit(&aim_config);
+    if (aim_yaw_motor == NULL)
+        LOGERROR("[steer-nav2] aiming yaw registration failed");
+    else
+    {
+        DJIMotorStop(aim_yaw_motor);
+        LOGINFO("[steer-nav2] aiming yaw registered id=%u",
+                (unsigned int)SENTRY_AIM_YAW_MOTOR_ID);
+    }
+    DJIMotorRegisterPreCurrentHook(LimitAimYawOutput);
+    LOGINFO("[steer-nav2] aiming yaw edges R=%u L=%u guards=%u/%u sign=%d",
+            (unsigned int)SENTRY_AIM_YAW_RIGHT_LIMIT_ECD,
+            (unsigned int)SENTRY_AIM_YAW_LEFT_LIMIT_ECD,
+            (unsigned int)SENTRY_AIM_YAW_RIGHT_GUARD_ECD,
+            (unsigned int)SENTRY_AIM_YAW_LEFT_GUARD_ECD,
+            (int)SENTRY_AIM_YAW_COMMAND_SIGN);
+
+    if (SENTRY_LOWER_YAW_DM_ENABLED)
+    {
+        Motor_Init_Config_s lower_config = {
+            .can_init_config = {
+                .can_handle = &SENTRY_LOWER_YAW_CAN_BUS,
+                .tx_id = SENTRY_LOWER_YAW_MOTOR_ID,
+                .rx_id = SENTRY_LOWER_YAW_MASTER_ID,
+            },
+            .controller_setting_init_config = {
+                .angle_feedback_source = MOTOR_FEED,
+                .speed_feedback_source = MOTOR_FEED,
+                .outer_loop_type = OPEN_LOOP,
+                .close_loop_type = OPEN_LOOP,
+                .motor_reverse_flag = SENTRY_LOWER_YAW_MOTOR_REVERSE,
+                .feedback_reverse_flag = FEEDBACK_DIRECTION_NORMAL,
+            },
+            .motor_type = MOTOR_TYPE_NONE,
+            .dm_auto_zero_on_boot = 0u,
+        };
+        lower_yaw_motor = DMMotorInit(&lower_config);
+        if (lower_yaw_motor == NULL)
+            LOGERROR("[steer-nav2] lower yaw ID 6 registration failed");
+        else
+        {
+            DMMotorSetControlMode(lower_yaw_motor, DM_MOTOR_CONTROL_SPEED);
+            DMMotorSetRef(lower_yaw_motor, 0.0f);
+            DMMotorStop(lower_yaw_motor);
+            LOGINFO("[steer-nav2] lower DaMiao yaw registered id=%u",
+                    (unsigned int)SENTRY_LOWER_YAW_MOTOR_ID);
+        }
+    }
+#if SENTRY_AIM_PITCH_ENABLED
+    aim_config.controller_setting_init_config.feedforward_flag = FEEDFORWARD_NONE;
+    aim_config.controller_param_init_config.speed_feedforward_ptr = NULL;
+    aim_config.can_init_config.can_handle = &SENTRY_AIM_PITCH_CAN_BUS;
+    aim_config.can_init_config.tx_id = SENTRY_AIM_PITCH_MOTOR_ID;
+    aim_config.controller_param_init_config.angle_PID.Kp = GIMBAL_PITCH_ANGLE_PID_KP;
+    aim_config.controller_param_init_config.speed_PID.Kp = GIMBAL_PITCH_SPEED_PID_KP;
+    aim_config.controller_param_init_config.speed_PID.Ki = GIMBAL_PITCH_SPEED_PID_KI;
+    aim_config.controller_setting_init_config.motor_reverse_flag = GIMBAL_PITCH_MOTOR_REVERSE;
+    aim_pitch_motor = DJIMotorInit(&aim_config);
+    if (aim_pitch_motor == NULL)
+        LOGERROR("[steer-nav2] aiming pitch registration failed");
+    else
+        DJIMotorStop(aim_pitch_motor);
+#endif
+
     usb_rx_buffer = USBInit(usb_config);
     LEDSetStatus(LED_STATUS_RED_ON);
     LOGINFO("[steer-nav2] waiting for motor feedback and USB velocity commands");
@@ -1101,18 +1602,18 @@ void SentrySteerNav2Init(void)
 
 void SentrySteerNav2Task(void)
 {
+    /* Deadlines must use the RTOS clock: debug attachment and DWT rollover
+       bookkeeping can disturb the cycle-counter timeline. */
     const uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+    CANPollRecoverAll();
+    const uint8_t steer_online = MotorOnlineBitmap(steer_motors);
+    const uint8_t drive_online = MotorOnlineBitmap(drive_motors);
     uint8_t command_fresh;
-    uint8_t steer_online;
-    uint8_t drive_online;
     float vx_mm_s;
     float vy_mm_s;
     float wz_mrad_s;
 
-    UpdateVisionLink(now_ms, 0u);
-    CANPollRecoverAll();
-    steer_online = MotorOnlineBitmap(steer_motors);
-    drive_online = MotorOnlineBitmap(drive_motors);
+    UpdateManualAim(now_ms);
 
     if (handled_rx_sequence != rx_sequence)
     {

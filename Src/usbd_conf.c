@@ -171,6 +171,12 @@ void HAL_PCD_SuspendCallback(PCD_HandleTypeDef *hpcd)
   __HAL_PCD_GATE_PHYCLOCK(hpcd);
   /* Enter in STOP mode. */
   /* USER CODE BEGIN 2 */
+  /* The controller runs continuously with low-power mode disabled. Leaving
+     STOPCLK set after a transient host suspend can stall CDC transfers. */
+  if (!hpcd->Init.low_power_enable)
+  {
+    __HAL_PCD_UNGATE_PHYCLOCK(hpcd);
+  }
   if (hpcd->Init.low_power_enable)
   {
     /* Set SLEEPDEEP bit and SleepOnExit of Cortex System Control Register. */
@@ -192,7 +198,7 @@ void HAL_PCD_ResumeCallback(PCD_HandleTypeDef *hpcd)
 #endif /* USE_HAL_PCD_REGISTER_CALLBACKS */
 {
   /* USER CODE BEGIN 3 */
-
+  __HAL_PCD_UNGATE_PHYCLOCK(hpcd);
   /* USER CODE END 3 */
   USBD_LL_Resume((USBD_HandleTypeDef*)hpcd->pData);
 }

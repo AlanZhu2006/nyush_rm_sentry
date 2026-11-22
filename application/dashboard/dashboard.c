@@ -158,6 +158,11 @@ static void DashboardCollectPayload(Dashboard_Payload_t *payload)
            sizeof(payload->motor_rpm));
     payload->motor_online_bitmap = dashboard_swerve_data.drive_online_bitmap;
     payload->status_flags = updated ? 0x10u : 0u;
+    payload->gimbal_yaw_target_deg = dashboard_swerve_data.aim_yaw_target_deg;
+    payload->gimbal_yaw_actual_deg = dashboard_swerve_data.aim_yaw_actual_deg;
+    payload->gimbal_yaw_target_deg_s = dashboard_swerve_data.aim_yaw_target_speed_deg_s;
+    payload->gimbal_yaw_actual_deg_s = dashboard_swerve_data.aim_yaw_actual_speed_deg_s;
+    payload->gimbal_yaw_encoder_raw = dashboard_swerve_data.aim_yaw_encoder_raw;
 
     if ((dashboard_swerve_data.steer_online_bitmap |
          dashboard_swerve_data.drive_online_bitmap) & 0x05u)
@@ -165,7 +170,15 @@ static void DashboardCollectPayload(Dashboard_Payload_t *payload)
     if ((dashboard_swerve_data.steer_online_bitmap |
          dashboard_swerve_data.drive_online_bitmap) & 0x0au)
         can_link_bitmap |= 0x02u;
-    payload->link_bitmap_packed = (uint8_t)((can_link_bitmap & 0x03u) << 5);
+    if (dashboard_swerve_data.aim_yaw_online)
+    {
+        if (&SENTRY_AIM_YAW_CAN_BUS == &hfdcan1)
+            can_link_bitmap |= 0x01u;
+        else if (&SENTRY_AIM_YAW_CAN_BUS == &hfdcan2)
+            can_link_bitmap |= 0x02u;
+    }
+    payload->link_bitmap_packed = (uint8_t)(((can_link_bitmap & 0x03u) << 5) |
+                                         (dashboard_swerve_data.aim_yaw_online ? 0x01u : 0u));
 
     payload->swerve_flags = DASHBOARD_SWERVE_VALID;
     if (dashboard_swerve_data.control_enabled)

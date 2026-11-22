@@ -212,17 +212,31 @@ class FastlioOdomAdapter(Node):
                 f"{self._source_world_frame}->{self._source_body_frame}"
             )
 
+        stamp = source.header.stamp.sec + source.header.stamp.nanosec * 1.0e-9
+        if stamp <= 0.0 or (self._previous_stamp is not None and stamp <= self._previous_stamp):
+            self.get_logger().warning(
+                "Ignoring FAST-LIO odometry with a non-increasing timestamp",
+                throttle_duration_sec=2.0,
+            )
+            return
+
         source_translation = (
             source.pose.pose.position.x,
             source.pose.pose.position.y,
             source.pose.pose.position.z,
         )
-        source_rotation = normalize_quaternion((
+        rotation = (
             source.pose.pose.orientation.x,
             source.pose.pose.orientation.y,
             source.pose.pose.orientation.z,
             source.pose.pose.orientation.w,
-        ))
+        )
+        if not all(math.isfinite(value) for value in (*source_translation, *rotation)):
+            self.get_logger().warning(
+                "Ignoring FAST-LIO odometry with a non-finite pose", throttle_duration_sec=2.0,
+            )
+            return
+        source_rotation = normalize_quaternion(rotation)
         base_translation, base_rotation = compose_transform(
             source_translation,
             source_rotation,
@@ -243,7 +257,6 @@ class FastlioOdomAdapter(Node):
         output.pose.pose.orientation.w = base_rotation[3]
         output.pose.covariance = source.pose.covariance
 
-        stamp = source.header.stamp.sec + source.header.stamp.nanosec * 1.0e-9
         self._update_velocity(stamp, base_translation, base_rotation)
         output.twist.twist.linear.x = self._filtered_twist[0]
         output.twist.twist.linear.y = self._filtered_twist[1]

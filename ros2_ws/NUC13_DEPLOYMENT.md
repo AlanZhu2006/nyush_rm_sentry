@@ -15,6 +15,8 @@ for direct comparison.
 
 - Firmware and deployment scripts: `/home/nyush/work/nyush_rm_sentry`
 - Pinned ROS source/build/install workspace: `/home/nyush/robot_ws`
+- Both project ROS packages in `robot_ws/src` link to the original
+  `nyush_rm_sentry` checkout after the NUC branch consolidation.
 - Tools: `~/.local/bin`, firmware/debugger Python environment: repository `.venv`
 - Environment: `~/.config/nyush-sentry/env.bash`; load with `sentry-env` in Bash
 - SDK library: `~/.local/lib`; J-Link: `~/.local/opt/JLink_Linux_V972_x86_64`

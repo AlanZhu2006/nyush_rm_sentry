@@ -17,7 +17,7 @@ diagnostic topic until dynamic wheel-odometry validation is complete.
 ## Contents
 
 - `dependencies.repos`: exact FAST-LIO, Livox, and pcd2pgm Git commits
-- `patches/fast_lio_mid360.patch`: mandatory density and latency changes
+- `patches/fast_lio_mid360.patch`: mandatory density, latency and gravity-alignment changes
 - `setup_workspace.sh`: non-destructive source workspace bootstrap/check
 - `src/mid360_nav_bringup`: launches, configuration, bridge, WASD, RViz
 - `src/icp_probe`: guarded full-map ICP/GICP initial localization
@@ -164,16 +164,15 @@ fresh `--token`, bind to localhost and tunnel over SSH, or restrict port 8088 in
 the firewall. The RTT dashboard on 8765 is also unauthenticated and should be
 treated as trusted-LAN diagnostics.
 
-The WASD page also has a gimbal **preview** panel for small yaw (GM6020),
-pitch (GM6020), and large yaw (LK9025), including manual, cruise, and combined
-scan requests. It publishes only `/gimbal/cmd_vel_preview`; the current ROS
-bridge and MCU do not drive gimbal motors from this topic. See
-[`docs/sentry-gimbal-staging.md`](../docs/sentry-gimbal-staging.md) for the axis
-mapping, limits, and hardware information needed before actuator integration.
+The WASD page has a separate small-yaw enable control and shows its online
+status and software limits. The host and controller use the shared USB
+protocol described in
+[`application/sentry/SENTRY_STEER_NAV2.md`](../application/sentry/SENTRY_STEER_NAV2.md).
 
 `just nav` deliberately requires a map name. There is no hidden fallback to
 `/home/nyu/b1.*`. A custom pair may be selected with `NAV_MAP_YAML` and
 `NAV_PCD_MAP`; the PCD and YAML/PGM must originate from the same mapping run.
+The tracked `arena` and `arena_nuc` map sets are available by name.
 
 Mapping and navigation share an exclusive lock because only one process may
 own the MID-360, FAST-LIO frames, chassis bridge, and command mux. Stop the
@@ -189,6 +188,46 @@ sha256sum -c SHA256SUMS
 
 ## 6. Runtime data flow and TF ownership
 
+FAST-LIO mapping and ICP navigation share the measured tilted MID-360 mount
+by default. Set `MID360_MOUNT_PROFILE=level` when using a level mount.
+Use the same mount profile when building and using a map. Explicit `lidar_*`
+launch overrides take precedence over the profile.
+
+### Dual MID-360
+
+Use `dual_lidar_mount_file` to enable fusion when both LiDARs are rigidly fixed
+to `base_link`. The file supplies `xyz: [x, y, z]` in meters and
+`rpy: [roll, pitch, yaw]` in radians for the secondary `.3` sensor. The body
+axes point forward, left and up. The candidate in `config/secondary_mount_candidate.yaml`
+was estimated from stationary points with the primary `.182` on the default
+tilted mount. Check the mounting against that estimate before enabling it in
+navigation. Power and connect both LiDARs before launching. The Livox driver
+sets the point and IMU receiver on both devices to `192.168.1.50`.
+
+For a stationary preview, source the ROS workspace and run the sensor-only
+launch with the calibrated mount file and the actual primary pose.
+
+```bash
+ros2 launch mid360_nav_bringup sensors.launch.py \
+  dual_lidar_mount_file:=/absolute/path/secondary_mount.yaml \
+  lidar_roll:=-0.01798 lidar_pitch:=1.03795
+```
+
+In RViz, set the fixed frame to `base_link` and add a `PointCloud2` display for
+`/lidar/points_fused`. Once the mount is confirmed, start navigation with the
+same calibration and the existing map.
+
+```bash
+just nav arena dual_lidar_mount_file:=/absolute/path/secondary_mount.yaml
+```
+
+FAST-LIO and ICP use the primary sensor for odometry and localization. The
+fusion node aligns both clouds to a common time using `odom` during navigation.
+The costmaps consume `/lidar/points_primary` and `/lidar/points_secondary`, so
+each marking and clearing observation has the correct sensor origin. `/scan`
+provides a planar projection of the fused cloud. The navigation guard requires
+fresh data from both sources in dual mode.
+
 ```text
 MID-360 CustomMsg + IMU
         │
@@ -203,6 +242,8 @@ fastlio_odom_adapter                           └── map -> odom
         └── /odom + odom -> base_link
                          │
 map server + Nav2 MPPI ──┴── /cmd_vel_nav_smoothed
+                                      │ navigation_guard
+                                      ▼ /cmd_vel_nav_ready
                                       │ priority 10
 browser WASD ── /cmd_vel_teleop ──────┤ priority 100
 emergency stop ────────────────────────┤ priority 255
@@ -225,6 +266,13 @@ Do not run AMCL or another localization publisher with `navigation_icp`; two
 beside the FAST-LIO adapter; two `odom -> base_link` publishers cause the same
 failure. The legacy 2D SLAM/AMCL launch files remain diagnostic alternatives,
 not automatic fallbacks.
+
+The navigation guard forwards autonomous velocity while ICP has accepted an
+alignment, scan and odometry stamps are advancing and current, and a Nav2
+navigation goal is executing. A reseed, browser chassis takeover, or chassis
+stop interrupts and cancels the previous navigation goal. To resume after
+cancellation, send a fresh goal. The USB bridge handles the chassis stop
+directly on `/emergency_stop`; the browser Space key remains a teleop zero.
 
 ## 7. Localization and navigation behavior
 

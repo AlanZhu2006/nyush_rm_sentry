@@ -358,13 +358,13 @@ offline-check:
   /usr/bin/python3 ros2_ws/system/offline_check.py
 
 # Check installed Nav2/ICP/RViz with synthetic localhost data, never hardware.
-runtime-check:
+runtime-check *args:
   @workspace="${ROBOT_WS:-${HOME}/robot_ws}"; \
   set +u; source /opt/ros/humble/setup.bash; source "${workspace}/install/setup.bash"; set -u; \
   export ROS_LOCALHOST_ONLY=1 ROS_DOMAIN_ID=182 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp; \
   export CYCLONEDDS_URI="file://{{justfile_directory()}}/ros2_ws/system/cyclonedds-test.xml"; \
   export DISPLAY=:2 XAUTHORITY="${HOME}/.vnc/sentry-Xauthority"; \
-  /usr/bin/python3 ros2_ws/system/runtime_check.py
+  /usr/bin/python3 ros2_ws/system/runtime_check.py {{args}}
 
 # Exercise the standalone PCD converter without overwriting the recorded map.
 map-converter-check:
@@ -429,6 +429,9 @@ vision-protocol-check:
 
 vision-bridge-check:
   python3 scripts/diagnostics/check_vision_bridge.py
+
+small-yaw-check:
+  just _py scripts/diagnostics/check_small_yaw_control.py
 
 # Own USB for this checkout and expose the shared SP vision PTY.
 # Do not run alongside another navigation bridge owning the same USB device.

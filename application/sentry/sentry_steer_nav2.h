@@ -57,6 +57,15 @@ typedef struct
     uint8_t flip_bitmap;
     uint8_t control_enabled;
     uint8_t command_fresh;
+    float aim_yaw_target_deg;
+    float aim_yaw_actual_deg;
+    float aim_yaw_target_speed_deg_s;
+    float aim_yaw_actual_speed_deg_s;
+    uint16_t aim_yaw_encoder_raw;
+    uint8_t aim_yaw_online;
+    uint8_t aim_yaw_active;
+    uint8_t aim_yaw_left_limit;
+    uint8_t aim_yaw_right_limit;
 } SentrySteerNav2Telemetry_s;
 
 extern volatile SentrySteerNav2State_s sentry_steer_nav2_state;

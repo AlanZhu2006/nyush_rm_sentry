@@ -1,16 +1,28 @@
-"""Fixed MID-360 pose in base_link.
+"""Shared default MID-360 mounting geometry for mapping and navigation."""
 
-Translation is meters. RPY is URDF radians (Rz*Ry*Rx), matching FAST-LIO's
-gravity-align formula: roll = atan2(ay, az), pitch = atan2(-ax, hypot(ay, az)).
+import os
 
-Measured 2026-09-20 from Livox IMU specific force while the chassis was in
-its operational pose: mean acc (-0.8583, -0.0091, 0.5061) g
--> roll -1.030 deg, pitch +59.470 deg. URDF +pitch points lidar +X down.
-"""
 
-LIDAR_X = '0.0'
-LIDAR_Y = '-0.11'
-LIDAR_Z = '0.35'
-LIDAR_ROLL = '-0.01798'
-LIDAR_PITCH = '1.03795'
-LIDAR_YAW = '0.0'
+def mount_defaults():
+    # On 2026-09-20, the static MID-360 IMU measured specific force
+    # (-0.8583, -0.0091, 0.5061) g in the chassis's operating pose.
+    # That gives URDF roll -1.03° and pitch +59.47° (+X points down).
+    profiles = {
+        'level': ('0.0', '0.0'),
+        'tilted': ('-0.01798', '1.03795'),
+    }
+    profile = os.environ.get('MID360_MOUNT_PROFILE', 'tilted')
+    try:
+        roll, pitch = profiles[profile]
+    except KeyError as error:
+        raise ValueError(
+            f'Unknown MID360_MOUNT_PROFILE {profile!r}. Use level or tilted.'
+        ) from error
+    return {
+        'lidar_x': '0.0',
+        'lidar_y': '-0.11',
+        'lidar_z': '0.35',
+        'lidar_roll': roll,
+        'lidar_pitch': pitch,
+        'lidar_yaw': '0.0',
+    }

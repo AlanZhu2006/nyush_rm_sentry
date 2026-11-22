@@ -5,6 +5,7 @@ This is a dependency and lifecycle smoke test, not a sensor/vehicle simulation.
 No navigation goal is sent. All children are scoped to localhost domain 182.
 """
 
+import argparse
 import math
 import os
 from pathlib import Path
@@ -32,6 +33,9 @@ def require(condition, message):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--headless", action="store_true", help="Skip VNC/RViz checks")
+    arguments = parser.parse_args()
     require(os.environ.get("ROS_LOCALHOST_ONLY") == "1", "localhost-only DDS")
     require(os.environ.get("ROS_DOMAIN_ID") == "182", "isolated runtime domain 182")
     require(os.environ.get("RMW_IMPLEMENTATION") == "rmw_cyclonedds_cpp",
@@ -75,17 +79,19 @@ def main():
                 "Livox custom message type support loads")
         for package, executable in (("fast_lio", "fastlio_mapping"),
                                     ("livox_ros_driver2", "livox_ros_driver2_node"),
-                                    ("icp_probe", "direct_icp_probe")):
+                                    ("icp_probe", "direct_icp_probe"),
+                                    ("mid360_nav_bringup", "dual_mid360_fusion")):
             binary = Path(get_package_prefix(package)) / "lib" / package / executable
             result = subprocess.run(["ldd", str(binary)], capture_output=True,
                                     text=True, env=child_env, timeout=10)
             require(result.returncode == 0 and "not found" not in result.stdout,
                     f"all shared libraries resolve: {package}")
 
-        with socket.create_connection(("127.0.0.1", 5902), timeout=3) as connection:
-            require(connection.recv(12).startswith(b"RFB 003."), "VNC speaks RFB on localhost:5902")
-        result = subprocess.run(["xdpyinfo"], env=child_env, capture_output=True, timeout=10)
-        require(result.returncode == 0, "independent VNC Xauthority grants X11 access")
+        if not arguments.headless:
+            with socket.create_connection(("127.0.0.1", 5902), timeout=3) as connection:
+                require(connection.recv(12).startswith(b"RFB 003."), "VNC speaks RFB on localhost:5902")
+            result = subprocess.run(["xdpyinfo"], env=child_env, capture_output=True, timeout=10)
+            require(result.returncode == 0, "independent VNC Xauthority grants X11 access")
 
         static_tf = StaticTransformBroadcaster(node)
         map_tf = TransformStamped()
@@ -139,8 +145,9 @@ def main():
                  "-p", "publish_map_to_odom:=false")
         start("nav2", ["ros2", "launch", "nav2_bringup", "navigation_launch.py",
                        f"params_file:={params}", "use_composition:=False", "autostart:=true"])
-        rviz_binary = Path(get_package_prefix("rviz2")) / "lib/rviz2/rviz2"
-        start("rviz", [str(rviz_binary), "-d", str(share / "rviz/nav2_vnc.rviz")])
+        if not arguments.headless:
+            rviz_binary = Path(get_package_prefix("rviz2")) / "lib/rviz2/rviz2"
+            start("rviz", [str(rviz_binary), "-d", str(share / "rviz/nav2_vnc.rviz")])
 
         names = ["map_server", "controller_server", "smoother_server", "planner_server",
                  "behavior_server", "bt_navigator", "waypoint_follower", "velocity_smoother"]
@@ -180,14 +187,16 @@ def main():
         require(future.done() and [v.string_value for v in future.result().values] ==
                 ["nav2_mppi_controller::MPPIController", "Omni"], "actual controller uses Omni MPPI")
         require("ICP ready:" in (logs / "icp.log").read_text(), "ICP loads the recorded PCD and initializes")
-        require("OpenGl version" in (logs / "rviz.log").read_text(), "RViz initializes OpenGL on VNC :2")
-        # Capture the dedicated test desktop for human visual inspection.
-        subprocess.run(["/usr/bin/python3", "-c",
-                        "from PyQt5.QtWidgets import QApplication; import sys; "
-                        "app=QApplication([]); "
-                        "sys.exit(0 if app.primaryScreen().grabWindow(0).save(sys.argv[1]) else 1)",
-                        str(logs / "rviz-vnc.png")],
-                       env=child_env, check=True, timeout=10)
+        if not arguments.headless:
+            require("OpenGl version" in (logs / "rviz.log").read_text(),
+                    "RViz initializes OpenGL on VNC :2")
+            # Capture the dedicated test desktop for human visual inspection.
+            subprocess.run(["/usr/bin/python3", "-c",
+                            "from PyQt5.QtWidgets import QApplication; import sys; "
+                            "app=QApplication([]); "
+                            "sys.exit(0 if app.primaryScreen().grabWindow(0).save(sys.argv[1]) else 1)",
+                            str(logs / "rviz-vnc.png")],
+                           env=child_env, check=True, timeout=10)
         require(all(process.poll() is None for _, process, _ in children), "all tested processes remain alive")
         print("No driver/USB bridge or navigation goal was started; sensor and motion validation remain required.", flush=True)
     finally:
