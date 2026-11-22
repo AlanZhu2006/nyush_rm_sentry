@@ -1,0 +1,443 @@
+set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
+
+default:
+  @just --list
+
+make_cmd := if os_family() == "windows" { "mingw32-make" } else { "make" }
+default_robot := "infantry"
+default_jobs := "12"
+default_pyocd_target := "stm32h723vghx"
+default_pyocd_connect := "under-reset"
+local_robot_file := ".robot_type"
+local_vscode_robot_header := ".vscode/robot_type.local.h"
+
+_requirements := "scripts/requirement.txt"
+
+[private]
+_ensure-py:
+  @root="{{justfile_directory()}}"; \
+  venv_dir="${PY_VENV_DIR:-${root}/.venv}"; \
+  if [[ -n "${VIRTUAL_ENV:-}" && -x "${VIRTUAL_ENV}/bin/python" ]]; then py="${VIRTUAL_ENV}/bin/python"; \
+  elif [[ -x "${venv_dir}/bin/python" ]]; then py="${venv_dir}/bin/python"; \
+  else \
+    if ! command -v python3 >/dev/null 2>&1; then \
+      echo "[py-env] python3 not found. Please install Python 3 first." >&2; exit 2; \
+    fi; \
+    echo "[py-env] creating virtual environment: ${venv_dir}" >&2; \
+    python3 -m venv "${venv_dir}"; \
+    py="${venv_dir}/bin/python"; \
+  fi; \
+  if ! "${py}" -c 'import serial, websockets, pyocd' >/dev/null 2>&1; then \
+    echo "[py-env] installing/updating requirements from {{_requirements}}" >&2; \
+    "${py}" -m ensurepip --upgrade >/dev/null 2>&1 || true; \
+    "${py}" -m pip install --upgrade pip >&2; \
+    "${py}" -m pip install -r "${root}/{{_requirements}}" >&2; \
+  fi; \
+  echo "${py}"
+
+[private]
+_py script *args:
+  @py="$(just _ensure-py)"; \
+  root="{{justfile_directory()}}"; \
+  if [[ "{{os_family()}}" == "unix" ]]; then \
+    for jlink_lib_dir in "${JLINK_LIB_DIR:-}" "${HOME}/.local/opt"/JLink_Linux_*; do \
+      if [[ -n "${jlink_lib_dir}" && -f "${jlink_lib_dir}/libjlinkarm.so" ]]; then \
+        export LD_LIBRARY_PATH="${jlink_lib_dir}:${LD_LIBRARY_PATH:-}"; \
+        break; \
+      fi; \
+    done; \
+  fi; \
+  exec "${py}" "${root}/{{script}}" {{args}}
+
+# Show all available recipes.
+help:
+  @just --list
+
+[private]
+_resolve-robot requested="":
+  @requested="{{requested}}"; \
+  robot_file="{{justfile_directory()}}/{{local_robot_file}}"; \
+  configured=""; \
+  if [[ -f "${robot_file}" ]]; then \
+    configured="$(tr -d '\r' < "${robot_file}" | sed -n 's/^[[:space:]]*//; s/[[:space:]]*$//; /^[[:space:]]*$/d; 1p')"; \
+  fi; \
+  if [[ -n "${configured}" ]]; then \
+    case "${configured}" in \
+      infantry|damiao|hero|sentry|sentry_swerve) ;; \
+      *) echo "Invalid robot type '${configured}' in {{local_robot_file}}. Use: infantry|damiao|hero|sentry|sentry_swerve." >&2; exit 2 ;; \
+    esac; \
+  fi; \
+  if [[ -z "${requested}" ]]; then \
+    if [[ -n "${configured}" ]]; then \
+      echo "${configured}"; \
+    else \
+      echo "{{default_robot}}"; \
+    fi; \
+    exit 0; \
+  fi; \
+  case "${requested}" in \
+    infantry|damiao|hero|sentry|sentry_swerve) ;; \
+    *) echo "Unsupported robot type '${requested}'. Use: infantry|damiao|hero|sentry|sentry_swerve." >&2; exit 2 ;; \
+  esac; \
+  if [[ -n "${configured}" && "${requested}" != "${configured}" ]]; then \
+    echo "Robot type '${requested}' conflicts with local robot '${configured}' from {{local_robot_file}}." >&2; \
+    exit 2; \
+  fi; \
+  echo "${requested}"
+
+[private]
+_sync-vscode-robot robot="":
+  @resolved_robot="$(just _resolve-robot "{{robot}}")"; \
+  header="{{justfile_directory()}}/{{local_vscode_robot_header}}"; \
+  tmp_header="${header}.tmp"; \
+  mkdir -p "$(dirname "${header}")"; \
+  printf '#pragma once\n#define ROBOT_TYPE_%s\n' "${resolved_robot}" > "${tmp_header}"; \
+  if [[ -f "${header}" ]] && cmp -s "${tmp_header}" "${header}"; then \
+    rm -f "${tmp_header}"; \
+  else \
+    mv "${tmp_header}" "${header}"; \
+  fi
+
+[private]
+_print-robot robot="":
+  @resolved_robot="$(just _resolve-robot "{{robot}}")"; \
+  echo "[robot] using ${resolved_robot}"
+
+# Sync VSCode IntelliSense robot define from `.robot_type`.
+sync-vscode-robot robot="":
+  @just _sync-vscode-robot "{{robot}}"
+
+# Build firmware with robot type and parallel jobs.
+build robot="" jobs=default_jobs:
+  @resolved_robot="$(just _resolve-robot "{{robot}}")"; \
+  just _print-robot "${resolved_robot}"; \
+  just _sync-vscode-robot "${resolved_robot}"; \
+  {{make_cmd}} -j{{jobs}} ROBOT_TYPE="${resolved_robot}"
+
+# Clean build artifacts.
+clean:
+  {{make_cmd}} clean
+
+# Clean then rebuild firmware.
+rebuild robot="" jobs=default_jobs:
+  @resolved_robot="$(just _resolve-robot "{{robot}}")"; \
+  just _sync-vscode-robot "${resolved_robot}"; \
+  {{make_cmd}} clean && {{make_cmd}} -j{{jobs}} ROBOT_TYPE="${resolved_robot}"
+
+# Run upstream Makefile help.
+make-help:
+  {{make_cmd}} help
+
+# Flash with DFU-util.
+flash-dfu robot="":
+  @resolved_robot="$(just _resolve-robot "{{robot}}")"; \
+  just _print-robot "${resolved_robot}"; \
+  just _sync-vscode-robot "${resolved_robot}"; \
+  {{make_cmd}} ROBOT_TYPE="${resolved_robot}" flash_dfu
+
+# Flash with pyOCD using any supported probe.
+flash-pyocd robot="" target=default_pyocd_target serial="" freq="" connect=default_pyocd_connect:
+  @resolved_robot="$(just _resolve-robot "{{robot}}")"; \
+  just _print-robot "${resolved_robot}"; \
+  just _sync-vscode-robot "${resolved_robot}"; \
+  {{make_cmd}} ROBOT_TYPE="${resolved_robot}" PYOCD_TARGET={{target}} DAP_SERIAL={{serial}} PYOCD_FREQUENCY={{freq}} PYOCD_CONNECT={{connect}} flash_pyocd
+
+# Backward-compatible aliases.
+flash-dap robot="" target=default_pyocd_target serial="" freq="" connect=default_pyocd_connect:
+  just flash-pyocd "{{robot}}" "{{target}}" "{{serial}}" "{{freq}}" "{{connect}}"
+
+flash-stlink robot="" target=default_pyocd_target serial="" freq="" connect=default_pyocd_connect:
+  just flash-pyocd "{{robot}}" "{{target}}" "{{serial}}" "{{freq}}" "{{connect}}"
+
+# Flash with JLinkExe.
+flash-jlink robot="" serial="" speed="4000":
+  @resolved_robot="$(just _resolve-robot "{{robot}}")"; \
+  just _print-robot "${resolved_robot}"; \
+  just _sync-vscode-robot "${resolved_robot}"; \
+  {{make_cmd}} ROBOT_TYPE="${resolved_robot}" JLINK_SERIAL="{{serial}}" JLINK_SPEED="{{speed}}" flash_jlink
+
+# Unified flash entrypoint.
+# Usage:
+#   just flash
+#   just flash pyocd
+#   just flash --method pyocd --robot hero --serial 69655005
+#   just flash dap --freq 100k --connect pre-reset
+flash *args:
+  @method="auto"; robot=""; target="{{default_pyocd_target}}"; serial=""; freq=""; connect="{{default_pyocd_connect}}"; \
+  set -- {{args}}; \
+  while [[ "$#" -gt 0 ]]; do \
+    case "$1" in \
+      --method) [[ "$#" -ge 2 ]] || { echo "Missing value for --method" >&2; exit 2; }; method="$2"; shift 2 ;; \
+      --robot) [[ "$#" -ge 2 ]] || { echo "Missing value for --robot" >&2; exit 2; }; robot="$2"; shift 2 ;; \
+      --target) [[ "$#" -ge 2 ]] || { echo "Missing value for --target" >&2; exit 2; }; target="$2"; shift 2 ;; \
+      --serial) [[ "$#" -ge 2 ]] || { echo "Missing value for --serial" >&2; exit 2; }; serial="$2"; shift 2 ;; \
+      --freq|--frequency) [[ "$#" -ge 2 ]] || { echo "Missing value for --freq" >&2; exit 2; }; freq="$2"; shift 2 ;; \
+      --connect) [[ "$#" -ge 2 ]] || { echo "Missing value for --connect" >&2; exit 2; }; connect="$2"; shift 2 ;; \
+      auto|dfu|pyocd|dap|stlink|dap-openocd|jlink) method="$1"; shift ;; \
+      halt|pre-reset|under-reset|attach) connect="$1"; shift ;; \
+      infantry|damiao|hero|sentry|sentry_swerve) robot="$1"; shift ;; \
+      *) echo "Unsupported flash arg: $1" >&2; exit 2 ;; \
+    esac; \
+  done; \
+  if [[ "${method}" == "dap-openocd" ]]; then \
+    method="pyocd"; \
+  fi; \
+  if [[ "$method" == "auto" ]]; then \
+    probe_lines=""; \
+    if command -v pyocd >/dev/null 2>&1; then \
+      probe_lines="$(pyocd list 2>/dev/null | awk '/^[[:space:]]*[0-9]+[[:space:]]+/ {print}')"; \
+      if [[ -n "$probe_lines" ]]; then \
+        non_jlink_lines="$(printf '%s\n' "$probe_lines" | grep -Evi 'j-?link' || true)"; \
+        if [[ -n "$non_jlink_lines" ]]; then \
+          method="pyocd"; \
+        fi; \
+      fi; \
+    fi; \
+    if [[ "$method" == "auto" ]] && command -v JLinkExe >/dev/null 2>&1; then \
+      jlink_output="$(printf 'ShowEmuList USB\nexit\n' | JLinkExe -NoGui 1 2>&1 || true)"; \
+      if printf '%s\n' "$jlink_output" | grep -Eq 'J-Link\[[0-9]+\]:'; then \
+        method="jlink"; \
+      fi; \
+    fi; \
+    if [[ "$method" == "auto" ]] && command -v dfu-util >/dev/null 2>&1 && dfu-util -l 2>/dev/null | grep -q 'Found DFU:'; then \
+      method="dfu"; \
+    fi; \
+    if [[ "$method" == "auto" ]]; then \
+      echo "No supported flash transport detected. Checked: pyOCD probes, J-Link, DFU." >&2; \
+      exit 2; \
+    fi; \
+  fi; \
+  if [[ "${method}" == "pyocd" || "${method}" == "dap" || "${method}" == "stlink" ]]; then \
+    busy_logger_pids="$(pgrep -f 'scripts/dashboard/rtt_(dashboard|ws_bridge)\.py' || true)"; \
+    safe_logger_pids=""; \
+    for pid in ${busy_logger_pids}; do \
+      if [[ "${pid}" != "$$" && "${pid}" != "${PPID:-0}" ]]; then \
+        safe_logger_pids+=" ${pid}"; \
+      fi; \
+    done; \
+    safe_logger_pids="${safe_logger_pids# }"; \
+    if [[ -n "${safe_logger_pids}" ]]; then \
+      echo "[flash] stopping RTT logger process(es) to free CMSIS-DAP probe: ${safe_logger_pids}"; \
+      kill -TERM ${safe_logger_pids} || true; \
+      sleep 1; \
+    fi; \
+  fi; \
+  resolved_robot="$(just _resolve-robot "${robot}")"; \
+  just _print-robot "${resolved_robot}"; \
+  just _sync-vscode-robot "${resolved_robot}"; \
+  case "${method}" in \
+    dfu) {{make_cmd}} ROBOT_TYPE="${resolved_robot}" flash_dfu ;; \
+    pyocd|dap|stlink) {{make_cmd}} ROBOT_TYPE="${resolved_robot}" PYOCD_TARGET="${target}" DAP_SERIAL="${serial}" PYOCD_FREQUENCY="${freq}" PYOCD_CONNECT="${connect}" flash_pyocd ;; \
+    jlink) {{make_cmd}} ROBOT_TYPE="${resolved_robot}" JLINK_SERIAL="${serial}" JLINK_SPEED="${freq:-4000}" flash_jlink ;; \
+    *) echo "Unsupported method='${method}'. Use: auto|dfu|pyocd|jlink (aliases: dap, stlink, dap-openocd -> pyocd)" >&2; exit 2 ;; \
+  esac
+
+# Ensure python env/deps, then run RTT logger.
+# Ensure python env/deps, then run RTT dashboard CLI.
+# Extra args pass-through: just logger-cli --mode split --serial 69655005
+logger-cli *args:
+  just _py scripts/dashboard/rtt_dashboard.py --mode dashboard --channel 1 --log-channel 0 --connect normal --poll-ms 20 --refresh-ms 100 {{args}}
+
+# Ensure python env/deps, then serve the RTT dashboard and WebSocket on LAN port 8765.
+# Extra args pass-through: just logger --serial 69655005
+logger *args:
+  just _py scripts/dashboard/rtt_ws_bridge.py --dashboard-channel 1 --log-channel 0 --ws-host 0.0.0.0 --ws-port 8765 --http-host 0.0.0.0 --http-port 8765 {{args}}
+
+# Ensure python env/deps, then run interactive vision serial tool.
+vision *args:
+  just _py scripts/vision_tool.py {{args}}
+
+# Start the browser WASD controller through the ROS 2 teleop topic.
+wasd *args:
+  @workspace="${ROBOT_WS:-${HOME}/robot_ws}"; launcher="${workspace}/src/mid360_nav_bringup/scripts/start_wasd.sh"; \
+  if [[ ! -x "${launcher}" ]]; then \
+    echo "WASD launcher not found: ${launcher}" >&2; exit 2; \
+  fi; \
+  exec "${launcher}" {{args}}
+
+# Start MID-360 + FAST-LIO mapping. Example: just map arena
+map *args:
+  @workspace="${ROBOT_WS:-${HOME}/robot_ws}"; launcher="${workspace}/src/mid360_nav_bringup/scripts/start_mapping.sh"; \
+  if [[ ! -x "${launcher}" ]]; then \
+    echo "Mapping launcher not found: ${launcher}" >&2; exit 2; \
+  fi; \
+  exec "${launcher}" {{args}}
+
+# Start the Foxglove operator backend on localhost:8766.
+foxglove:
+  @exec bash ros2_ws/foxglove/run.sh
+
+# Save the active FAST-LIO map as PCD + PGM + YAML. Example: just map-save arena
+map-save *args:
+  @workspace="${ROBOT_WS:-${HOME}/robot_ws}"; launcher="${workspace}/src/mid360_nav_bringup/scripts/save_map.sh"; \
+  if [[ ! -x "${launcher}" ]]; then \
+    echo "Map saver not found: ${launcher}" >&2; exit 2; \
+  fi; \
+  exec "${launcher}" {{args}}
+
+# Start MID-360 + ICP localization + Nav2. Example: just nav arena
+nav *args:
+  @workspace="${ROBOT_WS:-${HOME}/robot_ws}"; launcher="${workspace}/src/mid360_nav_bringup/scripts/start_navigation.sh"; \
+  if [[ ! -x "${launcher}" ]]; then \
+    echo "Navigation launcher not found: ${launcher}" >&2; exit 2; \
+  fi; \
+  exec "${launcher}" {{args}}
+
+# Build one ROS 2 package from the robot workspace. Example: just ros-build fast_lio
+ros-build package="fast_lio":
+  @package="{{package}}"; workspace="${ROBOT_WS:-${HOME}/robot_ws}"; \
+  if [[ ! "${package}" =~ ^[A-Za-z0-9_]+$ ]]; then \
+    echo "Invalid ROS package name: ${package}" >&2; exit 2; \
+  fi; \
+  if [[ ! -d "${workspace}/src" ]]; then \
+    echo "ROS workspace not found: ${workspace}" >&2; exit 2; \
+  fi; \
+  set +u; \
+  source "${ROS_SETUP:-/opt/ros/${ROS_DISTRO:-humble}/setup.bash}"; \
+  set -u; \
+  cd "${workspace}"; \
+  colcon build --symlink-install --packages-select "${package}" \
+    --allow-overriding "${package}"
+
+# Short aliases for daily use.
+b *args:
+  just build {{args}}
+
+f *args:
+  just flash {{args}}
+
+lc *args:
+  just logger-cli {{args}}
+
+lg *args:
+  just logger {{args}}
+
+# Install/repair python virtualenv and requirements.
+py-bootstrap:
+  @just _ensure-py >/dev/null
+  @echo "[py-env] ready"
+
+# Print python interpreter selected by env checker.
+py-which:
+  @just _ensure-py
+
+# Recreate the pinned ROS source workspace, including the recorded patch.
+ros-setup:
+  bash ros2_ws/setup_workspace.sh
+
+# Build/install Livox-SDK2 in the user prefix; no root build is needed.
+livox-sdk jobs="4":
+  @workspace="${ROBOT_WS:-${HOME}/robot_ws}"; \
+  cmake -S "${workspace}/src/Livox-SDK2" -B "${workspace}/build/livox_sdk2" \
+    -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="${HOME}/.local"; \
+  cmake --build "${workspace}/build/livox_sdk2" --parallel {{jobs}}; \
+  cmake --install "${workspace}/build/livox_sdk2"
+
+# Build the full ROS 2 workspace with bounded memory use on a 16 GB NUC.
+ros-build-all jobs="4":
+  @workspace="${ROBOT_WS:-${HOME}/robot_ws}"; \
+  set +u; source "${ROS_SETUP:-/opt/ros/${ROS_DISTRO:-humble}/setup.bash}"; set -u; \
+  export CMAKE_PREFIX_PATH="${HOME}/.local:${CMAKE_PREFIX_PATH:-}"; \
+  export LD_LIBRARY_PATH="${HOME}/.local/lib:${LD_LIBRARY_PATH:-}"; \
+  export CMAKE_BUILD_PARALLEL_LEVEL={{jobs}} MAKEFLAGS="-j{{jobs}}"; \
+  cd "${workspace}"; \
+  colcon build --symlink-install --executor sequential \
+    --cmake-args -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="${HOME}/.local" \
+      -DROS_EDITION=ROS2 -DDISTRO_ROS=humble
+
+# Verify source/map integrity without touching a USB controller.
+repro-check:
+  bash ros2_ws/setup_workspace.sh
+  cd ros2_ws/src/mid360_nav_bringup/maps && sha256sum -c SHA256SUMS
+  git diff --check
+
+# Preview the exact host package transaction without requiring root.
+host-packages-check:
+  bash ros2_ws/system/install_nuc_host.sh --simulate
+
+# Exercise the USB/ROS boundary without accessing real hardware or the LAN.
+offline-check:
+  @set +u; source /opt/ros/humble/setup.bash; set -u; \
+  export ROS_LOCALHOST_ONLY=1 ROS_DOMAIN_ID=181; \
+  /usr/bin/python3 ros2_ws/system/offline_check.py
+
+# Check installed Nav2/ICP/RViz with synthetic localhost data, never hardware.
+runtime-check *args:
+  @workspace="${ROBOT_WS:-${HOME}/robot_ws}"; \
+  set +u; source /opt/ros/humble/setup.bash; source "${workspace}/install/setup.bash"; set -u; \
+  export ROS_LOCALHOST_ONLY=1 ROS_DOMAIN_ID=182 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp; \
+  export CYCLONEDDS_URI="file://{{justfile_directory()}}/ros2_ws/system/cyclonedds-test.xml"; \
+  export DISPLAY=:2 XAUTHORITY="${HOME}/.vnc/sentry-Xauthority"; \
+  /usr/bin/python3 ros2_ws/system/runtime_check.py {{args}}
+
+# Exercise the standalone PCD converter without overwriting the recorded map.
+map-converter-check:
+  @workspace="${ROBOT_WS:-${HOME}/robot_ws}"; \
+  test_dir="$(mktemp -d /tmp/nyush-sentry-map-check.XXXXXX)"; \
+  "${workspace}/install/icp_probe/lib/icp_probe/pcd_to_pgm" \
+    --input ros2_ws/src/mid360_nav_bringup/maps/arena.pcd --output "${test_dir}/arena"
+
+# Install the exact MCU's CMSIS device support for the documented pyOCD target.
+debug-setup:
+  @py="$(just _ensure-py)"; "${py}" -m pyocd pack install STM32H723VG
+
+# Audit all ROS package dependencies against the package database.
+ros-deps-check:
+  @workspace="${ROBOT_WS:-${HOME}/robot_ws}"; \
+  rosdep check --from-paths "${workspace}/src" --ignore-src --rosdistro humble
+
+# Configure an SSH-tunneled VNC desktop after host packages are installed.
+vnc-setup:
+  bash ros2_ws/system/configure_nuc_vnc.sh
+
+# Check deployment script syntax and the Linux editor configuration.
+deployment-check:
+  @for script in ros2_ws/setup_workspace.sh ros2_ws/system/install_nuc_host.sh ros2_ws/system/configure_nuc_vnc.sh ros2_ws/system/sentry-xstartup; do bash -n "${script}"; done
+  @/usr/bin/python3 -c 'import ast, pathlib; [ast.parse(p.read_text(), filename=str(p)) for p in pathlib.Path("ros2_ws/system").glob("*_check.py")]'
+  /usr/bin/python3 -m json.tool .vscode/c_cpp_properties.json >/dev/null
+  git diff --check
+
+# Check installed debugger tooling without opening or resetting a target.
+debug-check:
+  @py="$(just _ensure-py)"; \
+  "${py}" -m pyocd list --targets | grep -i 'stm32h723vghx'; \
+  LD_LIBRARY_PATH="${HOME}/.local/opt/JLink_Linux_V972_x86_64:${LD_LIBRARY_PATH:-}" \
+    "${py}" -c 'import pylink; link = pylink.JLink(); print("SEGGER library:", link.version); print("Probes:", link.connected_emulators())'
+  @just logger --help >/dev/null
+
+# Report the exact built MCU artifact and active standalone entry point.
+artifact-check:
+  arm-none-eabi-size build/nyush_rm_control_h723.elf
+  sha256sum build/nyush_rm_control_h723.elf build/nyush_rm_control_h723.hex build/nyush_rm_control_h723.bin
+  arm-none-eabi-nm build/nyush_rm_control_h723.elf | grep ' T SentrySteerNav2Init'
+
+# Resume this NUC's deployment; sudo authenticates in the user's terminal.
+# This never flashes firmware or starts a robot control/navigation process.
+finish-nuc-deploy:
+  sudo bash ros2_ws/system/install_nuc_host.sh nyush enp86s0
+  rosdep update --rosdistro humble
+  just py-bootstrap
+  just ros-setup
+  just ros-deps-check
+  just livox-sdk 4
+  just ros-build-all 4
+  just build sentry_swerve 8
+  RMW_IMPLEMENTATION=rmw_cyclonedds_cpp just offline-check
+  just map-converter-check
+  just vnc-setup
+  just deployment-check
+
+# Host checks only; never opens physical robot devices.
+vision-protocol-check:
+  python3 scripts/diagnostics/check_sentry_vision.py
+
+vision-bridge-check:
+  python3 scripts/diagnostics/check_vision_bridge.py
+
+small-yaw-check:
+  just _py scripts/diagnostics/check_small_yaw_control.py
+
+# Own USB for this checkout and expose the shared SP vision PTY.
+# Do not run alongside another navigation bridge owning the same USB device.
+vision-bridge *args:
+  @source /opt/ros/humble/setup.bash; exec /usr/bin/python3 "{{justfile_directory()}}/ros2_ws/src/mid360_nav_bringup/scripts/sentry_nav2_bridge.py" {{args}}

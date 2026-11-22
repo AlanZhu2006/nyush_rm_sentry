@@ -1,0 +1,10 @@
+*.pcd
+*.pgm
+*.yaml
+*.lidar-mode
+!.gitignore
+!README.md
+!SHA256SUMS
+!arena.pcd
+!arena.pgm
+!arena.yaml

@@ -1,0 +1,14 @@
+foxglove_bridge:
+  ros__parameters:
+    address: 127.0.0.1
+    port: 18766
+    num_threads: 2
+    capabilities: [connectionGraph]
+    topic_whitelist:
+      - '^/(tf|tf_static|robot_description|map|scan|odom|Odometry|wheel/odom|plan|local_plan|rosout)$'
+      - '^/lidar/(points_fused|points_primary|points_secondary)$'
+      - '^/(global_costmap/costmap|local_costmap/costmap|icp_probe/ready)$'
+      - '^/sentry/operator/(status|log)$'
+      - '^/sentry/operator/rtt/(chassis_power_w|chassis_voltage_v|wheel_rpm|wheel_target_rpm)$'
+    service_whitelist: ['(?!)']
+    message_backlog_size: 128
