@@ -5,22 +5,23 @@ complete sets. Newly generated maps remain ignored until deliberately reviewed.
 
 Verify both tracked sets with `sha256sum -c SHA256SUMS` from this directory.
 
-Create and save a map named `arena` with the chassis on level ground:
+Create and save a dual-sensor map with the chassis initially on level ground:
 
-  just map arena
-  # Ctrl-C in that terminal saves PCD + PGM/YAML. `just map-save arena`
+  just map arena_dual
+  # Ctrl-C in that terminal saves PCD + PGM/YAML. `just map-save arena_dual`
   # still works if you want a snapshot without stopping mapping.
 
 FAST-LIO gravity-aligns `camera_init`. Verify the ground orientation and
 landmark alignment against the current sensor mount before driving on a saved
 map. Rebuild the map if its original frame is incompatible.
 
-The resulting `arena.pcd`, `arena.pgm`, and `arena.yaml` must stay together.
-The PCD is used by ICP localization; the PGM/YAML pair is used by Nav2.
+Keep the PCD, PGM, YAML and `.lidar-mode` files together. ICP uses the PCD
+and reads the marker to select its observation source. Nav2 uses the PGM/YAML
+pair. The pre-existing `arena` and `arena_nuc` files keep primary-cloud ICP.
 
 Start navigation with:
 
-  just nav arena
+  just nav arena_dual
 
 Keep the robot still while ICP searches within 2.25 m of the supplied initial
 pose and checks all headings. The current 1225-candidate full-map search can

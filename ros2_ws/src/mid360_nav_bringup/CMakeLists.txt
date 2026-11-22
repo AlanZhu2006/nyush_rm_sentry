@@ -6,6 +6,7 @@ find_package(geometry_msgs REQUIRED)
 find_package(livox_ros_driver2 REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(std_srvs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 
@@ -16,6 +17,12 @@ ament_target_dependencies(dual_mid360_fusion
   geometry_msgs livox_ros_driver2 rclcpp sensor_msgs tf2 tf2_ros
 )
 install(TARGETS dual_mid360_fusion DESTINATION lib/${PROJECT_NAME})
+
+add_executable(dual_mid360_map src/dual_mid360_map.cpp)
+target_compile_features(dual_mid360_map PRIVATE cxx_std_17)
+target_compile_options(dual_mid360_map PRIVATE -Wall -Wextra -Wpedantic)
+ament_target_dependencies(dual_mid360_map geometry_msgs rclcpp sensor_msgs std_srvs tf2 tf2_ros)
+install(TARGETS dual_mid360_map DESTINATION lib/${PROJECT_NAME})
 
 install(DIRECTORY launch config urdf maps rviz web
   DESTINATION share/${PROJECT_NAME}

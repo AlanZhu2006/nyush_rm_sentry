@@ -4,7 +4,7 @@ set -euo pipefail
 workspace_root="${ROBOT_WS:-${HOME}/robot_ws}"
 maps_dir="${MID360_MAPS_DIR:-$workspace_root/src/mid360_nav_bringup/maps}"
 ros_setup="${ROS_SETUP:-/opt/ros/${ROS_DISTRO:-humble}/setup.bash}"
-stack_lock="${MID360_STACK_LOCK:-/tmp/nyu_mid360_mapping_navigation.lock}"
+stack_lock="${MID360_STACK_LOCK:-$workspace_root/.mid360_mapping_navigation.lock}"
 
 # The MID-360/FAST-LIO/TF chain is single-owner.  Sharing this lock with the
 # navigation launcher prevents duplicate drivers and coordinate-frame trees.
@@ -84,15 +84,15 @@ if [[ ! "$map_name" =~ ^[A-Za-z0-9._-]+$ ]]; then
   exit 1
 fi
 
-pcd_path="$maps_dir/$map_name.pcd"
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 save_map_script="$script_dir/save_map.sh"
 mkdir -p "$maps_dir"
+pcd_path="$(realpath -- "$maps_dir")/$map_name.pcd"
 echo ">>> Starting MID-360 + FAST-LIO mapping"
 echo "    PCD output: $pcd_path"
 echo "    RViz display: ${DISPLAY:-not set}"
 echo "    Drive with /cmd_vel_teleop; Nav2 is not active in mapping mode."
-echo "    Ctrl-C saves $map_name (PCD + PGM/YAML) then stops the stack."
+echo "    Ctrl-C saves $map_name (PCD + PGM/YAML and LiDAR mode) then stops the stack."
 echo "    Skip the save with FASTLIO_MAP_AUTOSAVE=0. Manual save: just map-save $map_name"
 
 launch_pid=""
@@ -113,7 +113,6 @@ on_stop() {
     return
   fi
   stopping=1
-  trap '' INT TERM
   if [ -n "$launch_pid" ] && kill -0 "$launch_pid" 2>/dev/null \
       && [[ "${FASTLIO_MAP_AUTOSAVE:-1}" != "0" ]]; then
     echo ">>> Ctrl-C: saving map '$map_name' before shutdown"

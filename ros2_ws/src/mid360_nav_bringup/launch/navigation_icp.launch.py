@@ -18,6 +18,7 @@ _LAUNCH_DIR = str(Path(__file__).resolve().parent)
 if _LAUNCH_DIR not in sys.path:
     sys.path.insert(0, _LAUNCH_DIR)
 from lidar_mount import mount_defaults
+from mid360_launch import body_to_lidar_arguments, odometry_adapter, primary_lidar_topics
 
 
 def _dual_nav_params(context, params_file):
@@ -62,24 +63,42 @@ def _dual_nav_params(context, params_file):
     return RewrittenYaml(source_file=str(path), param_rewrites=rewrites)
 
 
+def _icp_cloud_topic(context, dual_lidar):
+    mode = LaunchConfiguration('icp_cloud_mode').perform(context)
+    if mode == 'auto':
+        pcd_map = Path(LaunchConfiguration('pcd_map').perform(context)).expanduser()
+        mode_file = pcd_map.with_suffix('.lidar-mode')
+        try:
+            mode = mode_file.read_text(encoding='utf-8').strip()
+        except FileNotFoundError:
+            mode = 'primary'
+        except (OSError, UnicodeError) as error:
+            raise ValueError(f'Cannot read LiDAR mode for {pcd_map}: {error}') from error
+        if mode not in ('primary', 'single', 'dual'):
+            raise ValueError(f'Invalid LiDAR mode {mode!r} in {mode_file}')
+
+    if mode == 'dual':
+        if not dual_lidar:
+            raise ValueError('icp_cloud_mode:=dual requires a secondary LiDAR mount file')
+        return '/lidar/points_fused'
+    return '/cloud_registered_body'
+
+
 def _configure_lidar_topics(context):
     dual_lidar = bool(LaunchConfiguration('dual_lidar_mount_file').perform(context))
+    lidar_topic, imu_topic = primary_lidar_topics(dual_lidar)
+    icp_cloud_topic = _icp_cloud_topic(context, dual_lidar)
     params_file = LaunchConfiguration('params_file')
     if dual_lidar:
         params_file = _dual_nav_params(context, params_file)
-        lidar_topic = '/livox/lidar_192_168_1_182'
-        imu_topic = '/livox/imu_192_168_1_182'
-        scan_cloud_topic = '/lidar/points_fused'
-    else:
-        lidar_topic = '/livox/lidar'
-        imu_topic = '/livox/imu'
-        scan_cloud_topic = '/cloud_registered_body'
+    scan_cloud_topic = '/lidar/points_fused' if dual_lidar else '/cloud_registered_body'
 
     return [
         SetLaunchConfiguration('mid360_dual_lidar', str(dual_lidar).lower()),
         SetLaunchConfiguration('mid360_primary_lidar_topic', lidar_topic),
         SetLaunchConfiguration('mid360_primary_imu_topic', imu_topic),
         SetLaunchConfiguration('mid360_scan_cloud_topic', scan_cloud_topic),
+        SetLaunchConfiguration('mid360_icp_cloud_topic', icp_cloud_topic),
         SetLaunchConfiguration('mid360_nav_params_file', params_file),
     ]
 
@@ -111,8 +130,9 @@ def generate_launch_description():
             'livox_config',
             default_value=str(share / 'config' / 'mid360_config.json')),
         DeclareLaunchArgument(
-            'dual_lidar_mount_file', default_value='',
-            description='Secondary MID-360 mount YAML with xyz in meters and rpy in radians'),
+            'dual_lidar_mount_file',
+            default_value=str(share / 'config' / 'secondary_mount_candidate.yaml'),
+            description='Secondary MID-360 mount YAML. Empty uses single LiDAR.'),
         DeclareLaunchArgument(
             'fastlio_config',
             default_value=str(fast_lio_share / 'config' / 'mid360.yaml')),
@@ -121,6 +141,9 @@ def generate_launch_description():
             'map', default_value=str(share / 'maps' / 'fastlio_map.yaml')),
         DeclareLaunchArgument(
             'pcd_map', default_value=str(share / 'maps' / 'fastlio_map.pcd')),
+        DeclareLaunchArgument(
+            'icp_cloud_mode', default_value='auto', choices=['auto', 'primary', 'dual'],
+            description='Auto uses a fused ICP cloud for maps with a dual LiDAR mode marker.'),
         DeclareLaunchArgument(
             'params_file',
             default_value=str(share / 'config' / 'nav2_params.yaml')),
@@ -136,13 +159,7 @@ def generate_launch_description():
         DeclareLaunchArgument('base_height', default_value='0.50'),
         *(DeclareLaunchArgument(name, default_value=value)
           for name, value in mount_defaults().items()),
-        # FAST-LIO mid360.yaml: LiDAR pose expressed in the IMU body frame.
-        DeclareLaunchArgument('body_to_lidar_x', default_value='-0.011'),
-        DeclareLaunchArgument('body_to_lidar_y', default_value='-0.02329'),
-        DeclareLaunchArgument('body_to_lidar_z', default_value='0.04412'),
-        DeclareLaunchArgument('body_to_lidar_roll', default_value='0.0'),
-        DeclareLaunchArgument('body_to_lidar_pitch', default_value='0.0'),
-        DeclareLaunchArgument('body_to_lidar_yaw', default_value='0.0'),
+        *body_to_lidar_arguments(),
         DeclareLaunchArgument('icp_auto_start', default_value='true'),
         DeclareLaunchArgument('initial_x', default_value='0.0'),
         DeclareLaunchArgument('initial_y', default_value='0.0'),
@@ -183,48 +200,7 @@ def generate_launch_description():
             remappings=[('/tf', '/fastlio/tf_internal')],
             on_exit=Shutdown(reason='FAST-LIO exited; no odometry fallback'),
         ),
-        Node(
-            package='mid360_nav_bringup',
-            executable='fastlio_odom_adapter.py',
-            name='fastlio_odom_adapter',
-            output='screen',
-            parameters=[{
-                'use_sim_time': ParameterValue(
-                    LaunchConfiguration('use_sim_time'), value_type=bool),
-                'source_odom_topic': '/Odometry',
-                'output_odom_topic': '/odom',
-                'source_world_frame': 'camera_init',
-                'source_body_frame': 'body',
-                'odom_frame': 'odom',
-                'base_frame': 'base_link',
-                'base_to_lidar_x': ParameterValue(
-                    LaunchConfiguration('lidar_x'), value_type=float),
-                'base_to_lidar_y': ParameterValue(
-                    LaunchConfiguration('lidar_y'), value_type=float),
-                'base_to_lidar_z': ParameterValue(
-                    LaunchConfiguration('lidar_z'), value_type=float),
-                'base_to_lidar_roll': ParameterValue(
-                    LaunchConfiguration('lidar_roll'), value_type=float),
-                'base_to_lidar_pitch': ParameterValue(
-                    LaunchConfiguration('lidar_pitch'), value_type=float),
-                'base_to_lidar_yaw': ParameterValue(
-                    LaunchConfiguration('lidar_yaw'), value_type=float),
-                'body_to_lidar_x': ParameterValue(
-                    LaunchConfiguration('body_to_lidar_x'), value_type=float),
-                'body_to_lidar_y': ParameterValue(
-                    LaunchConfiguration('body_to_lidar_y'), value_type=float),
-                'body_to_lidar_z': ParameterValue(
-                    LaunchConfiguration('body_to_lidar_z'), value_type=float),
-                'body_to_lidar_roll': ParameterValue(
-                    LaunchConfiguration('body_to_lidar_roll'), value_type=float),
-                'body_to_lidar_pitch': ParameterValue(
-                    LaunchConfiguration('body_to_lidar_pitch'), value_type=float),
-                'body_to_lidar_yaw': ParameterValue(
-                    LaunchConfiguration('body_to_lidar_yaw'), value_type=float),
-            }],
-            on_exit=Shutdown(
-                reason='FAST-LIO odometry adapter exited; no wheel fallback'),
-        ),
+        odometry_adapter('odom'),
         Node(
             package='pointcloud_to_laserscan',
             executable='pointcloud_to_laserscan_node',
@@ -280,7 +256,7 @@ def generate_launch_description():
                     'use_sim_time': ParameterValue(
                         LaunchConfiguration('use_sim_time'), value_type=bool),
                     'map_path': LaunchConfiguration('pcd_map'),
-                    'input_topic': '/cloud_registered_body',
+                    'input_topic': LaunchConfiguration('mid360_icp_cloud_topic'),
                     'auto_start': ParameterValue(
                         LaunchConfiguration('icp_auto_start'), value_type=bool),
                     'initial_x': ParameterValue(

@@ -12,6 +12,7 @@
   <depend>livox_ros_driver2</depend>
   <depend>rclcpp</depend>
   <depend>sensor_msgs</depend>
+  <depend>std_srvs</depend>
   <depend>tf2</depend>
   <depend>tf2_ros</depend>
 
@@ -38,7 +39,6 @@
   <exec_depend>rviz2</exec_depend>
   <exec_depend>slam_toolbox</exec_depend>
   <exec_depend>std_msgs</exec_depend>
-  <exec_depend>std_srvs</exec_depend>
   <exec_depend>twist_mux</exec_depend>
   <exec_depend>xacro</exec_depend>
 

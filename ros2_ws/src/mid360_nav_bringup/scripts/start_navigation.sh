@@ -4,7 +4,7 @@ set -euo pipefail
 workspace_root="${ROBOT_WS:-${HOME}/robot_ws}"
 maps_dir="${MID360_MAPS_DIR:-$workspace_root/src/mid360_nav_bringup/maps}"
 ros_setup="${ROS_SETUP:-/opt/ros/${ROS_DISTRO:-humble}/setup.bash}"
-stack_lock="${MID360_STACK_LOCK:-/tmp/nyu_mid360_mapping_navigation.lock}"
+stack_lock="${MID360_STACK_LOCK:-$workspace_root/.mid360_mapping_navigation.lock}"
 
 # Mapping and navigation own the MID-360, FAST-LIO frames and chassis command
 # path exclusively.  Never allow a second stack to create duplicate drivers,

@@ -195,14 +195,28 @@ launch overrides take precedence over the profile.
 
 ### Dual MID-360
 
-Use `dual_lidar_mount_file` to enable fusion when both LiDARs are rigidly fixed
-to `base_link`. The file supplies `xyz: [x, y, z]` in meters and
-`rpy: [roll, pitch, yaw]` in radians for the secondary `.3` sensor. The body
-axes point forward, left and up. The candidate in `config/secondary_mount_candidate.yaml`
-was estimated from stationary points with the primary `.182` on the default
-tilted mount. Check the mounting against that estimate before enabling it in
-navigation. Power and connect both LiDARs before launching. The Livox driver
-sets the point and IMU receiver on both devices to `192.168.1.50`.
+Both `just map` and `just nav` default to dual MID-360. The default secondary
+mount in `config/secondary_mount_candidate.yaml` comes from stationary point
+registration on this NUC with the primary MID-360 on the tilted mount. The
+two sensors must be rigidly fixed to `base_link`. If the mounts change, use
+`dual_lidar_mount_file:=/absolute/path/secondary_mount.yaml` with the matching
+primary pose. The file specifies `xyz` in meters and `rpy` in radians in
+the forward-left-up body frame.
+
+```bash
+just map arena_dual
+# Ctrl-C saves the map, or run just map-save arena_dual in another terminal.
+just nav arena_dual
+```
+
+FAST-LIO estimates motion from the primary point cloud and its own IMU.
+The fusion node uses that trajectory and the two mounts to align both clouds
+in time. Mapping accumulates the fused observations in `camera_init` into
+one PCD and derives the Nav2 PGM/YAML from it. The accompanying
+`arena_dual.lidar-mode` file selects fused cloud input for ICP. An existing
+map without the marker keeps its primary-cloud ICP input and uses both
+LiDARs for obstacle marking and clearing. Use the same mount calibration
+for creating and navigating with a map.
 
 For a stationary preview, source the ROS workspace and run the sensor-only
 launch with the calibrated mount file and the actual primary pose.
@@ -213,17 +227,12 @@ ros2 launch mid360_nav_bringup sensors.launch.py \
   lidar_roll:=-0.01798 lidar_pitch:=1.03795
 ```
 
-In RViz, set the fixed frame to `base_link` and add a `PointCloud2` display for
-`/lidar/points_fused`. Once the mount is confirmed, start navigation with the
-same calibration and the existing map.
+In the preview, set the RViz fixed frame to `base_link` and add a
+`PointCloud2` display for `/lidar/points_fused`. Single-sensor diagnostics
+can explicitly pass `dual_lidar_mount_file:=` with a primary map.
 
-```bash
-just nav arena dual_lidar_mount_file:=/absolute/path/secondary_mount.yaml
-```
-
-FAST-LIO and ICP use the primary sensor for odometry and localization. The
-fusion node aligns both clouds to a common time using `odom` during navigation.
-The costmaps consume `/lidar/points_primary` and `/lidar/points_secondary`, so
+During navigation, the fusion node aligns both clouds using `odom`. The
+costmaps consume `/lidar/points_primary` and `/lidar/points_secondary`, so
 each marking and clearing observation has the correct sensor origin. `/scan`
 provides a planar projection of the fused cloud. The navigation guard requires
 fresh data from both sources in dual mode.

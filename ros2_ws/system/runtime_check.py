@@ -80,7 +80,8 @@ def main():
         for package, executable in (("fast_lio", "fastlio_mapping"),
                                     ("livox_ros_driver2", "livox_ros_driver2_node"),
                                     ("icp_probe", "direct_icp_probe"),
-                                    ("mid360_nav_bringup", "dual_mid360_fusion")):
+                                    ("mid360_nav_bringup", "dual_mid360_fusion"),
+                                    ("mid360_nav_bringup", "dual_mid360_map")):
             binary = Path(get_package_prefix(package)) / "lib" / package / executable
             result = subprocess.run(["ldd", str(binary)], capture_output=True,
                                     text=True, env=child_env, timeout=10)
