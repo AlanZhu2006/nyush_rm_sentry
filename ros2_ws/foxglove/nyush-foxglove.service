@@ -1,0 +1,14 @@
+[Unit]
+Description=NYUSH Foxglove robot operator on localhost:8766
+
+[Service]
+Type=exec
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=%h/.config/nyush-foxglove/environment
+ExecStart=/usr/bin/bash -c 'cd "$$SENTRY_PROJECT" && exec /usr/bin/bash ros2_ws/foxglove/run.sh'
+Restart=always
+RestartSec=3
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

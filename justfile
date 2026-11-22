@@ -263,6 +263,10 @@ map *args:
   fi; \
   exec "${launcher}" {{args}}
 
+# Start the Foxglove operator backend on localhost:8766.
+foxglove:
+  @exec bash ros2_ws/foxglove/run.sh
+
 # Save the active FAST-LIO map as PCD + PGM + YAML. Example: just map-save arena
 map-save *args:
   @workspace="${ROBOT_WS:-${HOME}/robot_ws}"; launcher="${workspace}/src/mid360_nav_bringup/scripts/save_map.sh"; \

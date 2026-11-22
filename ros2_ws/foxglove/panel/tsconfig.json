@@ -1,0 +1,16 @@
+{
+  "extends": "create-foxglove-extension/tsconfig/tsconfig.json",
+  "include": ["src/**/*.ts"],
+  "compilerOptions": {
+    "lib": ["DOM", "ES2022"],
+    "target": "ES2022",
+    "composite": false,
+    "declaration": false,
+    "outDir": "dist",
+    "rootDir": "src",
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "forceConsistentCasingInFileNames": true
+  }
+}

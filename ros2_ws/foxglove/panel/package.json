@@ -1,0 +1,25 @@
+{
+  "name": "sentry-operator",
+  "displayName": "NYUSH Sentry Operator",
+  "description": "Operator panel for NYUSH Sentry mapping, navigation, manual chassis control, and logs.",
+  "publisher": "nyush-robotics",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "main": "./dist/extension.js",
+  "files": ["dist", "LICENSE", "THIRD_PARTY_NOTICES.txt"],
+  "scripts": {
+    "check": "tsc --noEmit",
+    "build": "foxglove-extension build",
+    "foxglove:prepublish": "foxglove-extension build --mode production",
+    "package": "foxglove-extension package"
+  },
+  "dependencies": {
+    "@foxglove/rosmsg-msgs-common": "3.3.0"
+  },
+  "devDependencies": {
+    "@foxglove/extension": "3.6.0",
+    "create-foxglove-extension": "1.3.2",
+    "typescript": "5.9.3"
+  }
+}

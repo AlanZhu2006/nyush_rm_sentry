@@ -22,6 +22,7 @@ diagnostic topic until dynamic wheel-odometry validation is complete.
 - `src/mid360_nav_bringup`: launches, configuration, bridge, WASD, RViz
 - `src/icp_probe`: guarded full-map ICP/GICP initial localization
 - `src/mid360_nav_bringup/maps/arena.*`: validated matching PCD/PGM/YAML set
+- [`foxglove/`](foxglove/README.md): operator panel, headless service, and SSH connection setup
 - `system/`: MID-360 Ethernet and persistent TigerVNC host configuration
 - `TESTED_ENVIRONMENT.md`: software/toolchain versions used for validation
 
