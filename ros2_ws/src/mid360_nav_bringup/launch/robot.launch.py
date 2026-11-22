@@ -16,7 +16,8 @@ def generate_launch_description():
     forwarded_sensor_args = {
         name: LaunchConfiguration(name) for name in (
             'use_sim_time', 'livox_config', 'xfer_format', 'use_scan',
-            'scan_cloud_topic', 'base_length', 'base_width',
+            'scan_cloud_topic', 'dual_lidar_mount_file', 'dual_lidar_fixed_frame',
+            'base_length', 'base_width',
             'base_height', 'lidar_x', 'lidar_y', 'lidar_z', 'lidar_roll',
             'lidar_pitch', 'lidar_yaw')
     }
@@ -29,7 +30,11 @@ def generate_launch_description():
         DeclareLaunchArgument('xfer_format', default_value='0'),
         DeclareLaunchArgument('use_scan', default_value='true'),
         DeclareLaunchArgument('scan_cloud_topic', default_value='/livox/lidar'),
+        DeclareLaunchArgument('dual_lidar_mount_file', default_value=''),
+        DeclareLaunchArgument('dual_lidar_fixed_frame', default_value=''),
         DeclareLaunchArgument('wheel_odom_topic', default_value='/wheel/odom'),
+        DeclareLaunchArgument(
+            'navigation_command_topic', default_value='/cmd_vel_nav_smoothed'),
         DeclareLaunchArgument('base_length', default_value='0.55'),
         DeclareLaunchArgument('base_width', default_value='0.55'),
         DeclareLaunchArgument('base_height', default_value='0.50'),
@@ -77,7 +82,10 @@ def generate_launch_description():
             executable='twist_mux',
             name='twist_mux',
             output='screen',
-            parameters=[str(share / 'config' / 'twist_mux.yaml')],
+            parameters=[
+                str(share / 'config' / 'twist_mux.yaml'),
+                {'topics.navigation.topic': LaunchConfiguration('navigation_command_topic')},
+            ],
             remappings=[('cmd_vel_out', '/cmd_vel')],
         ),
     ])

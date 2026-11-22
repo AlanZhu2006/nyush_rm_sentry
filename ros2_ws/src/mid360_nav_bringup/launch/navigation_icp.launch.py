@@ -1,14 +1,85 @@
 from pathlib import Path
+import sys
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import (DeclareLaunchArgument, GroupAction,
-                            IncludeLaunchDescription, Shutdown)
+                            IncludeLaunchDescription, OpaqueFunction,
+                            SetLaunchConfiguration, Shutdown)
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node, SetRemap
 from launch_ros.parameter_descriptions import ParameterValue
+from nav2_common.launch import RewrittenYaml
+import yaml
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from lidar_mount import mount_defaults
+
+
+def _dual_nav_params(context, params_file):
+    path = Path(params_file.perform(context)).expanduser()
+    try:
+        config = yaml.safe_load(path.read_text(encoding='utf-8'))
+    except (OSError, UnicodeError, yaml.YAMLError) as error:
+        raise ValueError(f'Cannot read dual LiDAR Nav2 parameters {path}: {error}') from error
+
+    observations = {
+        'lidar_primary': ('/lidar/points_primary', 'livox_frame'),
+        'lidar_secondary': ('/lidar/points_secondary', 'livox_secondary_frame'),
+    }
+    rewrites = {}
+    for costmap, layer in [('local_costmap', 'voxel_layer'),
+                           ('global_costmap', 'obstacle_layer')]:
+        try:
+            parameters = config[costmap][costmap]['ros__parameters']
+            layer_config = parameters[layer]
+        except (KeyError, TypeError) as error:
+            raise ValueError(f'{path}: missing Nav2 {costmap}.{layer} parameters') from error
+
+        layer_name = f'{costmap}.{layer}'
+        if not isinstance(layer_config, dict):
+            raise ValueError(f'{path}: missing Nav2 {layer_name} parameters')
+        plugins = parameters.get('plugins')
+        if (not isinstance(plugins, list) or layer not in plugins
+                or layer_config.get('enabled') is False):
+            raise ValueError(f'{path}: enable {layer_name} for dual LiDAR navigation')
+        if not isinstance(layer_config.get('observation_sources'), str):
+            raise ValueError(f'{path}: {layer_name} needs a string observation_sources parameter')
+        for source, (topic, frame) in observations.items():
+            info = layer_config.get(source)
+            if (not isinstance(info, dict) or info.get('topic') != topic
+                    or info.get('data_type') != 'PointCloud2'
+                    or info.get('sensor_frame', '') not in ('', frame)):
+                raise ValueError(
+                    f'{path}: {layer_name}.{source} must use {topic} (PointCloud2, frame {frame})')
+        rewrites[f'{costmap}.{costmap}.ros__parameters.{layer}.observation_sources'] = (
+            ' '.join(observations))
+
+    return RewrittenYaml(source_file=str(path), param_rewrites=rewrites)
+
+
+def _configure_lidar_topics(context):
+    dual_lidar = bool(LaunchConfiguration('dual_lidar_mount_file').perform(context))
+    params_file = LaunchConfiguration('params_file')
+    if dual_lidar:
+        params_file = _dual_nav_params(context, params_file)
+        lidar_topic = '/livox/lidar_192_168_1_182'
+        imu_topic = '/livox/imu_192_168_1_182'
+        scan_cloud_topic = '/lidar/points_fused'
+    else:
+        lidar_topic = '/livox/lidar'
+        imu_topic = '/livox/imu'
+        scan_cloud_topic = '/cloud_registered_body'
+
+    return [
+        SetLaunchConfiguration('mid360_dual_lidar', str(dual_lidar).lower()),
+        SetLaunchConfiguration('mid360_primary_lidar_topic', lidar_topic),
+        SetLaunchConfiguration('mid360_primary_imu_topic', imu_topic),
+        SetLaunchConfiguration('mid360_scan_cloud_topic', scan_cloud_topic),
+        SetLaunchConfiguration('mid360_nav_params_file', params_file),
+    ]
 
 
 def generate_launch_description():
@@ -18,7 +89,7 @@ def generate_launch_description():
 
     robot_args = {
         name: LaunchConfiguration(name) for name in (
-            'use_sim_time', 'chassis_port', 'livox_config',
+            'use_sim_time', 'chassis_port', 'livox_config', 'dual_lidar_mount_file',
             'wheel_odom_topic', 'base_length', 'base_width', 'base_height',
             'lidar_x', 'lidar_y', 'lidar_z', 'lidar_roll', 'lidar_pitch',
             'lidar_yaw')
@@ -27,6 +98,8 @@ def generate_launch_description():
         'use_ekf': 'false',
         'xfer_format': '1',
         'use_scan': 'false',
+        'dual_lidar_fixed_frame': 'odom',
+        'navigation_command_topic': '/cmd_vel_nav_ready',
     })
 
     return LaunchDescription([
@@ -35,6 +108,9 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'livox_config',
             default_value=str(share / 'config' / 'mid360_config.json')),
+        DeclareLaunchArgument(
+            'dual_lidar_mount_file', default_value='',
+            description='Secondary MID-360 mount YAML with xyz in meters and rpy in radians'),
         DeclareLaunchArgument(
             'fastlio_config',
             default_value=str(fast_lio_share / 'config' / 'mid360.yaml')),
@@ -56,12 +132,8 @@ def generate_launch_description():
         DeclareLaunchArgument('base_length', default_value='0.55'),
         DeclareLaunchArgument('base_width', default_value='0.55'),
         DeclareLaunchArgument('base_height', default_value='0.50'),
-        DeclareLaunchArgument('lidar_x', default_value='0.0'),
-        DeclareLaunchArgument('lidar_y', default_value='-0.11'),
-        DeclareLaunchArgument('lidar_z', default_value='0.35'),
-        DeclareLaunchArgument('lidar_roll', default_value='0.0'),
-        DeclareLaunchArgument('lidar_pitch', default_value='0.0'),
-        DeclareLaunchArgument('lidar_yaw', default_value='0.0'),
+        *(DeclareLaunchArgument(name, default_value=value)
+          for name, value in mount_defaults().items()),
         # FAST-LIO mid360.yaml: LiDAR pose expressed in the IMU body frame.
         DeclareLaunchArgument('body_to_lidar_x', default_value='-0.011'),
         DeclareLaunchArgument('body_to_lidar_y', default_value='-0.02329'),
@@ -78,6 +150,7 @@ def generate_launch_description():
         DeclareLaunchArgument('xy_search_steps', default_value='3'),
         DeclareLaunchArgument('yaw_offset_deg', default_value='180.0'),
 
+        OpaqueFunction(function=_configure_lidar_topics),
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(
                 str(share / 'launch' / 'robot.launch.py')),
@@ -93,8 +166,8 @@ def generate_launch_description():
                 {
                     'use_sim_time': ParameterValue(
                         LaunchConfiguration('use_sim_time'), value_type=bool),
-                    'common.lid_topic': '/livox/lidar',
-                    'common.imu_topic': '/livox/imu',
+                    'common.lid_topic': LaunchConfiguration('mid360_primary_lidar_topic'),
+                    'common.imu_topic': LaunchConfiguration('mid360_primary_imu_topic'),
                     'preprocess.lidar_type': 1,
                     'preprocess.timestamp_unit': 3,
                     'mapping.extrinsic_est_en': False,
@@ -163,7 +236,7 @@ def generate_launch_description():
                 },
             ],
             remappings=[
-                ('cloud_in', '/cloud_registered_body'),
+                ('cloud_in', LaunchConfiguration('mid360_scan_cloud_topic')),
                 ('scan', '/scan'),
             ],
         ),
@@ -224,6 +297,20 @@ def generate_launch_description():
                         LaunchConfiguration('yaw_offset_deg'), value_type=float),
                 },
             ],
+            on_exit=Shutdown(reason='ICP localization exited'),
+        ),
+        Node(
+            package='mid360_nav_bringup',
+            executable='navigation_guard.py',
+            name='navigation_guard',
+            output='screen',
+            parameters=[{
+                'use_sim_time': ParameterValue(
+                    LaunchConfiguration('use_sim_time'), value_type=bool),
+                'require_dual_lidar': ParameterValue(
+                    LaunchConfiguration('mid360_dual_lidar'), value_type=bool),
+            }],
+            on_exit=Shutdown(reason='navigation command guard exited'),
         ),
         GroupAction([
             SetRemap(src='/cmd_vel', dst='/cmd_vel_nav'),
@@ -233,7 +320,7 @@ def generate_launch_description():
                     str(nav2_share / 'launch' / 'navigation_launch.py')),
                 launch_arguments={
                     'use_sim_time': LaunchConfiguration('use_sim_time'),
-                    'params_file': LaunchConfiguration('params_file'),
+                    'params_file': LaunchConfiguration('mid360_nav_params_file'),
                     'autostart': LaunchConfiguration('autostart'),
                     'use_composition': 'False',
                 }.items(),

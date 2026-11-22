@@ -1,4 +1,5 @@
 from pathlib import Path
+import sys
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
@@ -8,6 +9,9 @@ from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from lidar_mount import mount_defaults
 
 
 def generate_launch_description():
@@ -45,12 +49,8 @@ def generate_launch_description():
         DeclareLaunchArgument('base_length', default_value='0.55'),
         DeclareLaunchArgument('base_width', default_value='0.55'),
         DeclareLaunchArgument('base_height', default_value='0.50'),
-        DeclareLaunchArgument('lidar_x', default_value='0.0'),
-        DeclareLaunchArgument('lidar_y', default_value='-0.11'),
-        DeclareLaunchArgument('lidar_z', default_value='0.35'),
-        DeclareLaunchArgument('lidar_roll', default_value='0.0'),
-        DeclareLaunchArgument('lidar_pitch', default_value='0.0'),
-        DeclareLaunchArgument('lidar_yaw', default_value='0.0'),
+        *(DeclareLaunchArgument(name, default_value=value)
+          for name, value in mount_defaults().items()),
 
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(

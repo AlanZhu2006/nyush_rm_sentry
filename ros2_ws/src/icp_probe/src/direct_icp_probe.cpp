@@ -4,6 +4,7 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -25,6 +26,7 @@
 #include <pcl_conversions/pcl_conversions.h>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <std_msgs/msg/bool.hpp>
 #include <tf2/exceptions.h>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_broadcaster.h>
@@ -33,6 +35,7 @@
 namespace {
 
 constexpr double kPi = 3.14159265358979323846;
+constexpr auto kTransformWait = std::chrono::milliseconds(200);
 
 double NormalizeAngle(double angle) {
   while (angle > kPi) {
@@ -198,6 +201,9 @@ class DirectIcpProbe : public rclcpp::Node {
         "/icp_probe/pose", rclcpp::QoS(1).transient_local());
     aligned_publisher_ = create_publisher<sensor_msgs::msg::PointCloud2>(
         "/icp_probe/aligned", rclcpp::QoS(1).transient_local());
+    ready_publisher_ = create_publisher<std_msgs::msg::Bool>(
+        "/icp_probe/ready", rclcpp::QoS(1).reliable().transient_local());
+    PublishReady(false);
     cloud_subscription_ = create_subscription<sensor_msgs::msg::PointCloud2>(
         input_topic_, rclcpp::SensorDataQoS(),
         std::bind(&DirectIcpProbe::CloudCallback, this,
@@ -210,6 +216,10 @@ class DirectIcpProbe : public rclcpp::Node {
     tf_timer_ = create_wall_timer(
         std::chrono::duration<double>(1.0 / std::max(tf_publish_rate, 0.1)),
         std::bind(&DirectIcpProbe::PublishMapToOdom, this));
+    transform_retry_timer_ = create_wall_timer(
+        std::chrono::milliseconds(20),
+        std::bind(&DirectIcpProbe::TryRegistration, this));
+    transform_retry_timer_->cancel();
 
     capture_enabled_ = auto_start_;
     RCLCPP_INFO(
@@ -223,6 +233,11 @@ class DirectIcpProbe : public rclcpp::Node {
   }
 
  private:
+  struct PendingCapture {
+    builtin_interfaces::msg::Time stamp;
+    std::chrono::steady_clock::time_point deadline;
+  };
+
   void ValidateParameters() const {
     if (frames_to_accumulate_ <= 0) {
       throw std::invalid_argument("frames_to_accumulate must be positive");
@@ -340,23 +355,33 @@ class DirectIcpProbe : public rclcpp::Node {
     }
 
     seed_map_to_initial_frame_ = PoseToEigen(message->pose.pose);
+    pending_capture_.reset();
+    transform_retry_timer_->cancel();
     accumulated_->clear();
     received_frames_ = 0;
     source_frame_.clear();
     retry_frames_remaining_ = 0;
     consistent_results_ = 0;
     capture_enabled_ = true;
+    PublishReady(false);
     RCLCPP_INFO(get_logger(),
                 "Initial pose received; collecting %d fresh frames for ICP",
                 frames_to_accumulate_);
   }
 
   void CloudCallback(const sensor_msgs::msg::PointCloud2::SharedPtr message) {
-    if (!capture_enabled_ || registration_running_) {
+    if (!capture_enabled_ || pending_capture_) {
       return;
     }
     if (retry_frames_remaining_ > 0) {
       --retry_frames_remaining_;
+      return;
+    }
+    const auto &stamp = message->header.stamp;
+    if (stamp.sec < 0 || (stamp.sec == 0 && stamp.nanosec == 0) ||
+        message->header.frame_id.empty()) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                           "Skipping cloud without a valid stamp and frame");
       return;
     }
     if (source_frame_.empty()) {
@@ -391,28 +416,50 @@ class DirectIcpProbe : public rclcpp::Node {
       return;
     }
 
-    capture_enabled_ = false;
-    registration_running_ = true;
+    // TF may arrive just after the cloud. Keep the capture briefly while
+    // waiting for matching transforms. Multi-frame captures assume no motion.
+    pending_capture_ = PendingCapture{
+        stamp, std::chrono::steady_clock::now() + kTransformWait};
+    transform_retry_timer_->reset();
+    TryRegistration();
+  }
+
+  void TryRegistration() {
+    if (!pending_capture_) {
+      return;
+    }
+    const auto stamp = pending_capture_->stamp;
+    const rclcpp::Time capture_time(stamp, get_clock()->get_clock_type());
+    Eigen::Affine3f odom_to_source;
+    Eigen::Affine3f initial_to_source = Eigen::Affine3f::Identity();
     try {
-      odom_to_source_ = tf_buffer_.lookupTransform(
-          odom_frame_, source_frame_, tf2::TimePointZero);
-      have_odom_to_source_ = true;
-      RCLCPP_INFO(get_logger(), "Captured %s->%s TF before registration",
-                  odom_frame_.c_str(), source_frame_.c_str());
+      odom_to_source = TransformToEigen(tf_buffer_.lookupTransform(
+          odom_frame_, source_frame_, capture_time));
+      if (initial_pose_frame_ != source_frame_) {
+        initial_to_source = TransformToEigen(tf_buffer_.lookupTransform(
+            initial_pose_frame_, source_frame_, capture_time));
+      }
     } catch (const tf2::TransformException &error) {
-      have_odom_to_source_ = false;
-      registration_running_ = false;
+      if (std::chrono::steady_clock::now() < pending_capture_->deadline) {
+        return;
+      }
+      pending_capture_.reset();
+      transform_retry_timer_->cancel();
       accumulated_->clear();
       received_frames_ = 0;
-      capture_enabled_ = true;
-      RCLCPP_ERROR(get_logger(),
-                   "Cannot localize: failed to look up %s->%s: %s",
-                   odom_frame_.c_str(), source_frame_.c_str(), error.what());
+      source_frame_.clear();
+      RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 2000,
+          "Skipping capture: TF unavailable at cloud stamp %d.%09u: %s",
+          stamp.sec, stamp.nanosec, error.what());
       return;
     }
 
-    const bool localized = RunRegistration(message->header.stamp);
-    registration_running_ = false;
+    pending_capture_.reset();
+    transform_retry_timer_->cancel();
+    capture_enabled_ = false;
+    const bool localized =
+        RunRegistration(stamp, odom_to_source, initial_to_source);
     if (!localized && retry_on_failure_) {
       PrepareRetry();
     }
@@ -428,24 +475,6 @@ class DirectIcpProbe : public rclcpp::Node {
                 "Localization not accepted; retrying with fresh scans after "
                 "%d skipped frame(s)",
                 retry_skip_frames_);
-  }
-
-  Eigen::Affine3f InitialMapToSourceGuess() {
-    if (initial_pose_frame_ == source_frame_) {
-      return seed_map_to_initial_frame_;
-    }
-    try {
-      const auto initial_to_source = tf_buffer_.lookupTransform(
-          initial_pose_frame_, source_frame_, tf2::TimePointZero);
-      return seed_map_to_initial_frame_ * TransformToEigen(initial_to_source);
-    } catch (const tf2::TransformException &error) {
-      RCLCPP_WARN(
-          get_logger(),
-          "Could not transform initial-pose frame %s to cloud frame %s: %s. "
-          "Treating the seed as a cloud-frame pose.",
-          initial_pose_frame_.c_str(), source_frame_.c_str(), error.what());
-      return seed_map_to_initial_frame_;
-    }
   }
 
   std::vector<Eigen::Matrix4f> BuildCandidates(
@@ -595,8 +624,11 @@ class DirectIcpProbe : public rclcpp::Node {
            yaw_delta <= consistency_yaw_deg_ * kPi / 180.0;
   }
 
-  bool RunRegistration(const builtin_interfaces::msg::Time &stamp) {
-    const Eigen::Affine3f base_guess = InitialMapToSourceGuess();
+  bool RunRegistration(const builtin_interfaces::msg::Time &stamp,
+                       const Eigen::Affine3f &odom_to_source,
+                       const Eigen::Affine3f &initial_to_source) {
+    const Eigen::Affine3f base_guess =
+        seed_map_to_initial_frame_ * initial_to_source;
     auto height_filtered_source =
         FilterSourceHeight(accumulated_, base_guess);
     auto source = Downsample(height_filtered_source, voxel_leaf_);
@@ -693,13 +725,8 @@ class DirectIcpProbe : public rclcpp::Node {
     aligned_message.header.frame_id = map_frame_;
     aligned_publisher_->publish(aligned_message);
 
-    if (!have_odom_to_source_) {
-      consistent_results_ = 0;
-      return false;
-    }
     const Eigen::Affine3f candidate_map_to_odom =
-        Eigen::Affine3f(map_to_source) *
-        TransformToEigen(odom_to_source_).inverse();
+        Eigen::Affine3f(map_to_source) * odom_to_source.inverse();
 
     if (consistent_results_ == 0 ||
         !IsConsistent(pending_map_to_odom_, candidate_map_to_odom)) {
@@ -733,8 +760,10 @@ class DirectIcpProbe : public rclcpp::Node {
     have_map_to_odom_ = true;
     PublishMapToOdom();
 
-    PublishBasePose(map_to_source, stamp);
+    PublishBasePose(Eigen::Affine3f(map_to_source) * initial_to_source.inverse(),
+                    stamp);
     if (publish_map_to_odom_) {
+      PublishReady(true);
       RCLCPP_WARN(
           get_logger(),
           "Accepted localization (fitness %.6f, overlap %.1f%%, RMSE %.4f m) "
@@ -749,21 +778,8 @@ class DirectIcpProbe : public rclcpp::Node {
     return true;
   }
 
-  void PublishBasePose(const Eigen::Matrix4f &map_to_source,
+  void PublishBasePose(const Eigen::Affine3f &map_to_initial_frame,
                        const builtin_interfaces::msg::Time &stamp) {
-    Eigen::Affine3f map_to_initial_frame(map_to_source);
-    if (initial_pose_frame_ != source_frame_) {
-      try {
-        const auto initial_to_source = tf_buffer_.lookupTransform(
-            initial_pose_frame_, source_frame_, tf2::TimePointZero);
-        map_to_initial_frame = Eigen::Affine3f(map_to_source) *
-                               TransformToEigen(initial_to_source).inverse();
-      } catch (const tf2::TransformException &error) {
-        RCLCPP_WARN(get_logger(), "Publishing cloud-frame pose: %s",
-                    error.what());
-      }
-    }
-
     Eigen::Quaternionf quaternion(map_to_initial_frame.rotation());
     quaternion.normalize();
     geometry_msgs::msg::PoseStamped pose;
@@ -777,6 +793,12 @@ class DirectIcpProbe : public rclcpp::Node {
     pose.pose.orientation.z = quaternion.z();
     pose.pose.orientation.w = quaternion.w();
     pose_publisher_->publish(pose);
+  }
+
+  void PublishReady(bool ready) {
+    std_msgs::msg::Bool message;
+    message.data = ready;
+    ready_publisher_->publish(message);
   }
 
   void PublishMapToOdom() {
@@ -826,13 +848,12 @@ class DirectIcpProbe : public rclcpp::Node {
   bool auto_start_;
   bool retry_on_failure_;
   bool capture_enabled_ = false;
-  bool registration_running_ = false;
-  bool have_odom_to_source_ = false;
   bool have_map_to_odom_ = false;
   Cloud::Ptr target_;
   Cloud::Ptr accumulated_{new Cloud};
   Eigen::Affine3f seed_map_to_initial_frame_ = Eigen::Affine3f::Identity();
   Eigen::Affine3f pending_map_to_odom_ = Eigen::Affine3f::Identity();
+  std::optional<PendingCapture> pending_capture_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr
       cloud_subscription_;
   rclcpp::Subscription<
@@ -840,11 +861,12 @@ class DirectIcpProbe : public rclcpp::Node {
       initial_pose_subscription_;
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pose_publisher_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr aligned_publisher_;
+  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr ready_publisher_;
   tf2_ros::Buffer tf_buffer_;
   tf2_ros::TransformListener tf_listener_;
   tf2_ros::TransformBroadcaster tf_broadcaster_;
   rclcpp::TimerBase::SharedPtr tf_timer_;
-  geometry_msgs::msg::TransformStamped odom_to_source_;
+  rclcpp::TimerBase::SharedPtr transform_retry_timer_;
   geometry_msgs::msg::TransformStamped map_to_odom_;
 };
 

@@ -10,9 +10,32 @@
 
 // The inherited sentry ID 6 is the lower yaw on this robot, not aiming yaw.
 #undef GIMBAL_YAW_MOTOR_ID
-#define GIMBAL_YAW_MOTOR_ID 3
-#define SENTRY_AIM_YAW_CAN_BUS hfdcan1
+#define GIMBAL_YAW_MOTOR_ID 4
+#define SENTRY_AIM_YAW_CAN_BUS hfdcan2
 #define SENTRY_AIM_YAW_MOTOR_ID GIMBAL_YAW_MOTOR_ID
+// Operator-confirmed right mechanical edge, captured 2026-10-28 while stopped.
+// Logical +yaw means left; this mechanism's encoder increases toward right.
+#define SENTRY_AIM_YAW_COMMAND_SIGN (-1)
+#define SENTRY_AIM_YAW_MAX_RATE_MRAD_S 600.0f
+#define SENTRY_AIM_YAW_ACCEL_RAD_S2 2.0f
+#define SENTRY_AIM_YAW_BRAKE_RAD_S2 3.0f
+#define SENTRY_AIM_YAW_SPEED_FEEDFORWARD_GAIN 0.8f
+#define SENTRY_AIM_YAW_ANGLE_DEADBAND_DEG 0.10f
+// Reduce speed-feedback amplification after the recorded 18-20 Hz oscillation.
+#define SENTRY_AIM_YAW_SPEED_PID_KP 20.0f
+#define SENTRY_AIM_YAW_SPEED_PID_KI 40.0f
+#define SENTRY_AIM_YAW_SPEED_PID_INT_LIMIT 3000.0f
+#define SENTRY_AIM_YAW_RIGHT_LIMIT_ECD 7309u
+// Operator-confirmed left mechanical edge, captured 2026-10-30 while stopped.
+#define SENTRY_AIM_YAW_LEFT_LIMIT_ECD 4569u
+// A six-count release/backlash was observed after reset; keep a wider inward guard.
+#define SENTRY_AIM_YAW_RIGHT_GUARD_ECD 16u
+#define SENTRY_AIM_YAW_LEFT_GUARD_ECD 16u
+// Account for observed five-count position tracking/release near a soft stop.
+#define SENTRY_AIM_YAW_LIMIT_TOLERANCE_ECD 8u
+#define SENTRY_AIM_YAW_LIMIT_RELEASE_ECD 32u
+#define SENTRY_AIM_YAW_TRAVEL_ECD \
+    ((SENTRY_AIM_YAW_RIGHT_LIMIT_ECD + 8192u - SENTRY_AIM_YAW_LEFT_LIMIT_ECD) % 8192u)
 // Lower yaw: DaMiao on CAN1 ID 6 (operator-confirmed).
 #define SENTRY_LOWER_YAW_MOTOR_ID 6u
 #define SENTRY_LOWER_YAW_CAN_BUS hfdcan1
@@ -24,7 +47,9 @@
 #define SENTRY_AIM_PITCH_ENABLED 0
 #define SENTRY_AIM_PITCH_CAN_BUS hfdcan2
 #define SENTRY_AIM_PITCH_MOTOR_ID 7
-#define SENTRY_AIM_YAW_TRAVEL_DEG 10.0f
+// The physical span is 120.410 degrees; both guards are applied in the controller.
+#define SENTRY_AIM_YAW_TRAVEL_DEG \
+    ((float)SENTRY_AIM_YAW_TRAVEL_ECD * (360.0f / 8192.0f))
 #define SENTRY_AIM_PITCH_TRAVEL_DEG 5.0f
 #define SENTRY_AIM_COMMAND_TIMEOUT_MS 300u
 #define SENTRY_STEER_KEYBOARD_LOG_PERIOD_MS 500u
@@ -44,11 +69,12 @@
 #define CHASSIS_STEER_MOTOR_RB_ID 3
 #define CHASSIS_STEER_MOTOR_LB_ID 4
 
-// Measured mechanical zero positions (GM6020 single-turn ECD, 0..8191).
-#define CHASSIS_STEER_MOTOR_LF_ZERO_ECD 5484u
-#define CHASSIS_STEER_MOTOR_RF_ZERO_ECD 702u
-#define CHASSIS_STEER_MOTOR_RB_ZERO_ECD 3407u
-#define CHASSIS_STEER_MOTOR_LB_ZERO_ECD 6106u
+// 2026-09-20 NUC calibration after squaring the modules to vehicle-forward.
+// Left-front still needs physical verification after the reported -135-degree error.
+#define CHASSIS_STEER_MOTOR_LF_ZERO_ECD 6141u
+#define CHASSIS_STEER_MOTOR_RF_ZERO_ECD 6814u
+#define CHASSIS_STEER_MOTOR_RB_ZERO_ECD 1358u
+#define CHASSIS_STEER_MOTOR_LB_ZERO_ECD 4081u
 
 // USB keyboard steering test settings. ID order is LF, RF, left-rear, right-rear.
 #define CHASSIS_STEER_KEYBOARD_ONLINE_STABLE_MS 200u

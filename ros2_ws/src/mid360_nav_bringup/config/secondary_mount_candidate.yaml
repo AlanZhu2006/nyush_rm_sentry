@@ -1,0 +1,4 @@
+# Stationary cloud registration for secondary MID-360 47MCNCC0033014.
+# Validate the rigid mount and the primary tilted mount before navigation.
+xyz: [-0.4224, -0.1220, 0.3625]
+rpy: [0.04384, 1.02162, -3.08542]

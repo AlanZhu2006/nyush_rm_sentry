@@ -308,3 +308,18 @@ py-bootstrap:
 # Print python interpreter selected by env checker.
 py-which:
   @just _ensure-py
+
+# Host checks only; never opens physical robot devices.
+vision-protocol-check:
+  python3 scripts/diagnostics/check_sentry_vision.py
+
+vision-bridge-check:
+  python3 scripts/diagnostics/check_vision_bridge.py
+
+small-yaw-check:
+  just _py scripts/diagnostics/check_small_yaw_control.py
+
+# Own USB for this checkout and expose the shared SP vision PTY.
+# Do not run alongside another navigation bridge owning the same USB device.
+vision-bridge *args:
+  @source /opt/ros/humble/setup.bash; exec /usr/bin/python3 "{{justfile_directory()}}/ros2_ws/src/mid360_nav_bringup/scripts/sentry_nav2_bridge.py" {{args}}

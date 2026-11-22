@@ -7,6 +7,7 @@ Communicates with the STM32 MCU over UART/VCP using SP protocol. Supports:
 
     python3 vision_tool.py
 """
+import argparse
 import math
 import struct
 import sys
@@ -359,13 +360,17 @@ def run_write(ser: serial.Serial):
 # Main
 # ---------------------------------------------------------------------------
 def main():
+    parser = argparse.ArgumentParser(description="SP diagnostics through the shared USB bridge")
+    parser.add_argument("--port", default="/tmp/nyush-rm-sentry-vision",
+                        help="SP bridge PTY (explicitly set a hardware port only for legacy direct SP)")
+    arguments = parser.parse_args()
     print()
     print(f"  {BOLD}╔════════════════════════════════════════════════╗{RESET}")
     print(f"  {BOLD}║   Vision Tool  -  SP protocol v2.0             ║{RESET}")
     print(f"  {BOLD}╚════════════════════════════════════════════════╝{RESET}")
     print()
 
-    port = pick_port()
+    port = arguments.port
     if not port:
         return
     baud = 115200  # Adjust if needed

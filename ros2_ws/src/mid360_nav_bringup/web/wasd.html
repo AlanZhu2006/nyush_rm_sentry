@@ -116,6 +116,8 @@
     }
     .key.stop { color: var(--red); font-size: 20px; }
     .key.blank { visibility: hidden; }
+    .yaw-keys { display: grid; grid-template-columns: 1fr 1fr; gap: 11px; touch-action: none; user-select: none; }
+    button:disabled { cursor: not-allowed; opacity: .5; }
     .readout { display: grid; gap: 12px; }
     .metric { padding: 15px; border: 1px solid var(--line); border-radius: 14px; background: rgba(7, 17, 29, .45); }
     .metric span { color: var(--muted); font-size: 12px; }
@@ -177,18 +179,36 @@
         <div class="toolbar" style="margin-top:18px;margin-bottom:0">
           <button id="spin" class="enable" type="button">B · BEYBLADE OFF</button>
         </div>
+        <div class="toolbar" style="margin-top:22px;margin-bottom:11px">
+          <button id="smallYawEnable" class="enable" type="button" disabled>ENABLE SMALL YAW</button>
+        </div>
+        <div class="yaw-keys" aria-label="小 yaw 控制">
+          <button class="key" data-key="j" type="button">J<small>小 yaw 左转 · 按住</small></button>
+          <button class="key" data-key="l" type="button">L<small>小 yaw 右转 · 按住</small></button>
+        </div>
         <div id="message" class="message">点击 ENABLE CONTROL 后开始操作</div>
       </section>
 
       <aside class="card readout">
+        <div class="metric"><span>底盘反馈</span><strong id="chassisStatus">等待底盘在线反馈</strong></div>
         <div class="metric"><span>线速度</span><strong id="linear">0.00 m/s</strong></div>
         <div class="metric"><span>角速度</span><strong id="angular">0.00 rad/s</strong></div>
+        <div class="metric"><span>小 yaw 反馈</span><strong id="smallYawStatus">等待控制器反馈</strong></div>
+        <div class="metric"><span>小 yaw 软件限位</span><strong id="smallYawLimit">等待限位反馈</strong></div>
+        <div class="metric"><span>小 yaw 编码器</span><strong id="smallYawEncoder">等待编码器反馈</strong></div>
+        <div class="metric"><span>小 yaw 指令速度</span><strong id="smallYawRate">0.00 rad/s</strong></div>
+        <div class="metric"><span>小 yaw 跟踪误差</span><strong id="smallYawError">等待角度反馈</strong></div>
         <div class="metric"><span>当前按键</span><strong id="activeKeys">—</strong></div>
-        <div class="metric"><span>上云台瞄准</span><strong>← → yaw · pitch 待确认接线</strong></div>
         <div class="metric"><span>看门狗</span><strong id="watchdog">350 ms</strong></div>
         <div class="notice">
           初次测试请架空车轮。松开按键、切换窗口、关闭页面或网络中断都会自动停车。
-          B 控制下云台 CAN1 ID 6 达妙电机；pitch 仍需确认行程。
+          WASD/QE 需单独开启 ENABLE CONTROL；ENABLE SMALL YAW 只开启 J/L。
+          B 开启后底盘按固定角速度自转，W/A/S/D 仍会叠加平移，同时请求下云台反向自转
+          （若该电机不在线，指令会被安全忽略）。再按一次 B 关闭，恢复 Q/E 直接控制。
+          小 yaw 在线后可单独使能，按住 J/L 或对应按钮转动，松开即发送零速并保持角度；
+          不需要启用底盘。J 向左、L 向右；到达左限位禁止继续左转，到达右限位禁止继续右转，可反向退出。
+          左右限位已固定，断电重启不会重置；两端各留约 0.7° 的内侧余量。
+          限位状态根据编码器判断，不是机械限位开关信号。
           <kbd>Esc</kbd> 解除控制，<kbd>Space</kbd> 立即发送零速。页面默认无密码，
           仅限可信局域网使用，请勿将 8088 端口映射到公网。
         </div>
@@ -210,16 +230,26 @@
     const client = sessionStorage.getItem("nyushTeleopClient") || createClientId();
     sessionStorage.setItem("nyushTeleopClient", client);
 
-    const allowed = new Set(["w", "a", "s", "d", "q", "e", "arrowleft", "arrowright", "arrowup", "arrowdown"]);
+    const allowed = new Set(["w", "a", "s", "d", "q", "e", "j", "l"]);
+    const smallYawKeys = new Set(["j", "l"]);
     const pressed = new Set();
     let armed = false;
     let spinEnabled = false;
+    let smallYawArmed = false;
+    let smallYawOnline = null;
+    let smallYawRightLimit = null;
+    let smallYawLeftLimit = null;
+    let smallYawError = null;
+    let smallYawEncoder = null;
+    let chassisReady = null;
+    let chassisControlEnabled = null;
+    let chassisBlockReason = "等待底盘在线反馈";
+    let smallYawRate = 0.60;
     let sequence = 0;
     let speedScale = 1.0;
     let linearLimit = 0.80;
     let angularLimit = 2.40;
-    let spinAvailable = false;
-    let pitchAvailable = false;
+    let beybladeRate = 0.50;
     let requestFailed = false;
 
     const elements = {
@@ -229,6 +259,13 @@
       scale: document.getElementById("speedScale"),
       stop: document.getElementById("stop"),
       spin: document.getElementById("spin"),
+      smallYawEnable: document.getElementById("smallYawEnable"),
+      smallYawStatus: document.getElementById("smallYawStatus"),
+      smallYawLimit: document.getElementById("smallYawLimit"),
+      smallYawRate: document.getElementById("smallYawRate"),
+      smallYawError: document.getElementById("smallYawError"),
+      smallYawEncoder: document.getElementById("smallYawEncoder"),
+      chassisStatus: document.getElementById("chassisStatus"),
       message: document.getElementById("message"),
       linear: document.getElementById("linear"),
       angular: document.getElementById("angular"),
@@ -264,31 +301,56 @@
 
     function render(message = "") {
       const vector = commandVector();
-      const moving = armed && (vector.vx !== 0 || vector.vy !== 0 || vector.wz !== 0);
-      elements.status.className = `status ${requestFailed ? "error" : moving ? "moving" : armed ? "armed" : "connected"}`;
-      elements.statusText.textContent = requestFailed ? "CONNECTION LOST" : moving ? "MOVING" : armed ? "ARMED" : "DISARMED";
+      const yawNow = smallYawArmed && !(pressed.has("j") && pressed.has("l")) ? (Number(pressed.has("j") && smallYawLeftLimit === false) - Number(pressed.has("l") && smallYawRightLimit === false)) * smallYawRate * speedScale : 0;
+      const anyArmed = armed || smallYawArmed;
+      const moving = (armed && (vector.vx !== 0 || vector.vy !== 0 || vector.wz !== 0 || spinEnabled)) || yawNow !== 0;
+      elements.status.className = `status ${requestFailed ? "error" : moving ? "moving" : anyArmed ? "armed" : "connected"}`;
+      elements.statusText.textContent = requestFailed ? "CONNECTION LOST" : moving ? "MOVING" : anyArmed ? "ARMED" : "DISARMED";
       elements.enable.classList.toggle("on", armed);
       elements.enable.textContent = armed ? "DISABLE CONTROL" : "ENABLE CONTROL";
       elements.spin.classList.toggle("on", armed && spinEnabled);
-      elements.spin.disabled = !spinAvailable;
-      elements.spin.textContent = spinAvailable ? `B · SPIN REQUEST ${armed && spinEnabled ? "ON" : "OFF"}` : "B · LOWER YAW DISABLED";
-      elements.keyButtons.forEach(button => button.classList.toggle("pressed", pressed.has(button.dataset.key)));
+      elements.spin.textContent = `B · BEYBLADE ${armed && spinEnabled ? "ON" : "OFF"}`;
+      elements.smallYawEnable.classList.toggle("on", smallYawArmed);
+      elements.smallYawEnable.textContent = smallYawArmed ? "DISABLE SMALL YAW" : "ENABLE SMALL YAW";
+      elements.smallYawEnable.disabled = !smallYawArmed && smallYawOnline !== true;
+      elements.smallYawStatus.textContent = smallYawOnline === true ? "在线" : smallYawOnline === false ? "离线" : "等待控制器反馈";
+      elements.chassisStatus.textContent = chassisReady === true ? `底盘电机全部在线${chassisControlEnabled === true ? " · 控制已使能" : ""}` : chassisBlockReason;
+      elements.smallYawLimit.textContent = smallYawLeftLimit === true && smallYawRightLimit === true ? "限位异常：禁止转动" : smallYawLeftLimit === null || smallYawRightLimit === null ? "等待完整限位反馈" : smallYawLeftLimit ? "左限位：禁止左转，可向右退出" : smallYawRightLimit ? "右限位：禁止右转，可向左退出" : "软件限位未触发";
+      elements.smallYawEncoder.textContent = smallYawEncoder === null ? "等待编码器反馈" : `ECD ${smallYawEncoder}`;
+      elements.smallYawRate.textContent = `${yawNow.toFixed(2)} rad/s`;
+      elements.smallYawError.textContent = smallYawError === null ? "等待角度反馈" : `${smallYawError.toFixed(2)}°`;
+      elements.keyButtons.forEach(button => {
+        const key = button.dataset.key;
+        button.classList.toggle("pressed", pressed.has(key));
+        if (smallYawKeys.has(key)) {
+          button.disabled = !smallYawArmed || (key === "l" && smallYawRightLimit !== false) || (key === "j" && smallYawLeftLimit !== false);
+        }
+      });
       elements.activeKeys.textContent = pressed.size ? [...pressed].map(key => key.toUpperCase()).join(" + ") : "—";
       elements.linear.textContent = `${(Math.hypot(vector.vx, vector.vy) * linearLimit * speedScale).toFixed(2)} m/s`;
-      elements.angular.textContent = `${(vector.wz * angularLimit * speedScale).toFixed(2)} rad/s`;
-      elements.message.textContent = message || (armed ? "控制已启用；保持页面在前台" : "点击 ENABLE CONTROL 后开始操作");
+      const angularNow = armed && spinEnabled ? beybladeRate : vector.wz * angularLimit * speedScale;
+      elements.angular.textContent = `${angularNow.toFixed(2)} rad/s`;
+      const controlHint = chassisReady === false ? `底盘未就绪：${chassisBlockReason}；小 yaw 可独立使能` : chassisReady === true && !armed ? "底盘已就绪；点击 ENABLE CONTROL 使用 WASD" : anyArmed ? "控制已启用；保持页面在前台" : "底盘与小 yaw 可分别使能";
+      elements.message.textContent = message || controlHint;
       elements.message.classList.toggle("error", requestFailed);
     }
 
-    async function claimControl() {
-      pressed.clear();
-      spinEnabled = false;
-      const data = await api("/api/claim", "POST", {client});
-      armed = true;
+    async function claimControl(axis = "chassis") {
+      if (!armed && !smallYawArmed) {
+        pressed.clear();
+        spinEnabled = false;
+        const data = await api("/api/claim", "POST", {client});
+        applyServerState(data.state);
+      }
+      if (axis === "small_yaw") {
+        if (smallYawOnline !== true) throw new Error("小 yaw 尚无有效在线反馈");
+        smallYawArmed = true;
+      } else {
+        armed = true;
+      }
       requestFailed = false;
       render("已取得控制权");
       await sendControl();
-      applyServerState(data.state);
     }
 
     async function sendControl(keepalive = false) {
@@ -299,27 +361,33 @@
         keys: [...pressed],
         speed_scale: speedScale,
         spin_enabled: spinEnabled,
+        small_yaw_armed: smallYawArmed,
       };
       try {
         const data = await api("/api/control", "POST", payload, keepalive);
         requestFailed = false;
-        applyServerState(data.state);
+        applyServerState(data.state, payload.sequence === sequence);
       } catch (error) {
         requestFailed = true;
         armed = false;
         spinEnabled = false;
+        smallYawArmed = false;
+        smallYawOnline = null;
+        smallYawRightLimit = null;
+        smallYawLeftLimit = null;
+        smallYawError = null;
+        smallYawEncoder = null;
         pressed.clear();
         render(error.message);
       }
     }
 
     async function releaseControl(reason = "控制已解除") {
-      const held = armed;
       armed = false;
       spinEnabled = false;
+      smallYawArmed = false;
       pressed.clear();
       render(reason);
-      if (!held) return;
       try {
         await api("/api/release", "POST", {client}, true);
         requestFailed = false;
@@ -329,19 +397,51 @@
       render(reason);
     }
 
-    function applyServerState(state) {
+    function applyServerState(state, syncArming = false) {
       if (!state) return;
       linearLimit = Number(state.linear_speed ?? linearLimit);
       angularLimit = Number(state.angular_speed ?? angularLimit);
-      spinAvailable = Boolean(state.lower_spin_available ?? spinAvailable);
-      pitchAvailable = Boolean(state.pitch_available ?? pitchAvailable);
+      beybladeRate = Number(state.beyblade_spin_rate ?? beybladeRate);
+      smallYawRate = Number(state.small_yaw_rate ?? smallYawRate);
+      smallYawOnline = state.small_yaw_online ?? null;
+      smallYawRightLimit = state.small_yaw_right_limit ?? null;
+      smallYawLeftLimit = state.small_yaw_left_limit ?? null;
+      smallYawError = Number.isFinite(state.small_yaw_error_deg) ? state.small_yaw_error_deg : null;
+      smallYawEncoder = Number.isFinite(state.small_yaw_ecd) ? state.small_yaw_ecd : null;
+      chassisReady = state.chassis_ready ?? null;
+      chassisControlEnabled = state.chassis_control_enabled ?? null;
+      chassisBlockReason = typeof state.chassis_block_reason === "string" ? state.chassis_block_reason : "等待底盘在线反馈";
+      if ((smallYawRightLimit !== false && pressed.has("l")) || (smallYawLeftLimit !== false && pressed.has("j"))) {
+        pressed.delete("j");
+        pressed.delete("l");
+      }
+      if (syncArming) {
+        armed = Boolean(state.armed) && state.active_client === client;
+        smallYawArmed = Boolean(state.small_yaw_armed) && state.active_client === client;
+        if (!armed) {
+          spinEnabled = false;
+          for (const key of [...pressed]) if (!smallYawKeys.has(key)) pressed.delete(key);
+        }
+      }
+      if (!smallYawArmed || smallYawOnline !== true) {
+        smallYawArmed = false;
+        for (const key of smallYawKeys) pressed.delete(key);
+      }
       if (state.watchdog_s) elements.watchdog.textContent = `${Math.round(state.watchdog_s * 1000)} ms`;
       render();
     }
 
     function pressKey(key) {
-      if (!pitchAvailable && (key === "arrowup" || key === "arrowdown")) return;
-      if (!armed || pressed.has(key)) return;
+      if (!(smallYawKeys.has(key) ? smallYawArmed : armed) || pressed.has(key)) return;
+      if ((key === "l" && smallYawRightLimit !== false) || (key === "j" && smallYawLeftLimit !== false)) {
+        if (pressed.has(key === "j" ? "l" : "j")) {
+          pressed.delete("j");
+          pressed.delete("l");
+          render();
+          void sendControl();
+        }
+        return;
+      }
       pressed.add(key);
       render();
       void sendControl();
@@ -356,28 +456,48 @@
     function stopMotion() {
       pressed.clear();
       spinEnabled = false;
+      smallYawArmed = false;
       render("零速已发送");
       if (armed) void sendControl();
+      else void releaseControl("零速已发送");
     }
 
     elements.enable.addEventListener("click", async () => {
       try {
-        if (armed) await releaseControl(); else await claimControl();
+        if (armed) {
+          armed = false;
+          spinEnabled = false;
+          for (const key of [...pressed]) if (!smallYawKeys.has(key)) pressed.delete(key);
+          if (smallYawArmed) await sendControl(); else await releaseControl();
+        } else await claimControl();
       } catch (error) {
         requestFailed = true;
         armed = false;
+        smallYawArmed = false;
         pressed.clear();
         render(error.message);
+      }
+    });
+    elements.smallYawEnable.addEventListener("click", async () => {
+      try {
+        if (smallYawArmed) {
+          smallYawArmed = false;
+          for (const key of smallYawKeys) pressed.delete(key);
+          if (armed) await sendControl(); else await releaseControl();
+        } else await claimControl("small_yaw");
+        render();
+      } catch (error) {
+        await releaseControl(error.message);
       }
     });
     elements.scale.addEventListener("change", () => {
       speedScale = Number(elements.scale.value);
       render();
-      if (armed) void sendControl();
+      if (armed || smallYawArmed) void sendControl();
     });
     elements.stop.addEventListener("pointerdown", event => { event.preventDefault(); stopMotion(); });
     elements.spin.addEventListener("click", () => {
-      if (!armed || !spinAvailable) return;
+      if (!armed) return;
       spinEnabled = !spinEnabled;
       render();
       void sendControl();
@@ -401,7 +521,7 @@
       if (key === " ") { event.preventDefault(); stopMotion(); return; }
       if (key === "b") {
         event.preventDefault();
-        if (!event.repeat && armed && spinAvailable) { spinEnabled = !spinEnabled; render(); void sendControl(); }
+        if (!event.repeat && armed) { spinEnabled = !spinEnabled; render(); void sendControl(); }
         return;
       }
       if (!allowed.has(key)) return;
@@ -414,21 +534,22 @@
       event.preventDefault();
       releaseKey(key);
     });
-    window.addEventListener("blur", () => { if (armed) void releaseControl("页面失焦：已自动停车"); });
+    window.addEventListener("blur", () => { if (armed || smallYawArmed) void releaseControl("页面失焦：已自动停车"); });
     document.addEventListener("visibilitychange", () => {
-      if (document.hidden && armed) void releaseControl("页面隐藏：已自动停车");
+      if (document.hidden && (armed || smallYawArmed)) void releaseControl("页面隐藏：已自动停车");
     });
     window.addEventListener("pagehide", () => {
       armed = false;
       spinEnabled = false;
+      smallYawArmed = false;
       pressed.clear();
       const body = new Blob([JSON.stringify({client})], {type: "application/json"});
       navigator.sendBeacon(apiUrl("/api/release"), body);
     });
 
-    setInterval(() => { if (armed) void sendControl(); }, 100);
+    setInterval(() => { if (armed || smallYawArmed) void sendControl(); }, 100);
     setInterval(async () => {
-      if (armed) return;
+      if (armed || smallYawArmed) return;
       try {
         const data = await api("/api/state");
         requestFailed = false;

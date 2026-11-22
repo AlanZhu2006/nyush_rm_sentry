@@ -246,10 +246,40 @@ local_costmap:
         observation_sources: scan
         scan:
           topic: /scan
+          # Scan points lie on the base_link plane, below z=0 in FAST-LIO odom.
+          min_obstacle_height: -0.50
           max_obstacle_height: 0.80
+          # Worst allowed interval in seconds for the nominal 10 Hz scan.
+          expected_update_rate: 0.50
           clearing: true
           marking: true
           data_type: LaserScan
+          raytrace_max_range: 25.0
+          raytrace_min_range: 0.20
+          obstacle_max_range: 20.0
+          obstacle_min_range: 0.20
+        lidar_primary:
+          topic: /lidar/points_primary
+          sensor_frame: livox_frame
+          min_obstacle_height: -0.50
+          max_obstacle_height: 0.80
+          expected_update_rate: 0.50
+          clearing: true
+          marking: true
+          data_type: PointCloud2
+          raytrace_max_range: 25.0
+          raytrace_min_range: 0.20
+          obstacle_max_range: 20.0
+          obstacle_min_range: 0.20
+        lidar_secondary:
+          topic: /lidar/points_secondary
+          sensor_frame: livox_secondary_frame
+          min_obstacle_height: -0.50
+          max_obstacle_height: 0.80
+          expected_update_rate: 0.50
+          clearing: true
+          marking: true
+          data_type: PointCloud2
           raytrace_max_range: 25.0
           raytrace_min_range: 0.20
           obstacle_max_range: 20.0
@@ -284,13 +314,44 @@ global_costmap:
       obstacle_layer:
         plugin: nav2_costmap_2d::ObstacleLayer
         enabled: true
+        # A PCD map can put the base_link scan plane below z=0. Both the
+        # layer and its scan observation buffer must accept that height.
+        min_obstacle_height: -0.50
         observation_sources: scan
         scan:
           topic: /scan
+          min_obstacle_height: -0.50
           max_obstacle_height: 0.80
+          expected_update_rate: 0.50
           clearing: true
           marking: true
           data_type: LaserScan
+          raytrace_max_range: 25.0
+          raytrace_min_range: 0.20
+          obstacle_max_range: 20.0
+          obstacle_min_range: 0.20
+        lidar_primary:
+          topic: /lidar/points_primary
+          sensor_frame: livox_frame
+          min_obstacle_height: -0.50
+          max_obstacle_height: 0.80
+          expected_update_rate: 0.50
+          clearing: true
+          marking: true
+          data_type: PointCloud2
+          raytrace_max_range: 25.0
+          raytrace_min_range: 0.20
+          obstacle_max_range: 20.0
+          obstacle_min_range: 0.20
+        lidar_secondary:
+          topic: /lidar/points_secondary
+          sensor_frame: livox_secondary_frame
+          min_obstacle_height: -0.50
+          max_obstacle_height: 0.80
+          expected_update_rate: 0.50
+          clearing: true
+          marking: true
+          data_type: PointCloud2
           raytrace_max_range: 25.0
           raytrace_min_range: 0.20
           obstacle_max_range: 20.0

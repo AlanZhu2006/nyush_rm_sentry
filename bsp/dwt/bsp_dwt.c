@@ -17,6 +17,27 @@ static uint32_t CYCCNT_RountCount;
 static uint32_t CYCCNT_LAST;
 static uint64_t CYCCNT64;
 
+static void DWT_EnableCounter(void)
+{
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+#if defined(__CORTEX_M) && (__CORTEX_M == 7U)
+    /* Cortex-M7 trace registers can be locked independently of TRCENA. */
+    DWT->LAR = 0xC5ACCE55u;
+#endif
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+    __DSB();
+    __ISB();
+}
+
+static void DWT_EnsureCounter(void)
+{
+    /* A debugger may disable tracing when it detaches. Restore it without
+       resetting the timestamp used by motor feedback and PID loops. */
+    if ((CoreDebug->DEMCR & CoreDebug_DEMCR_TRCENA_Msk) == 0u ||
+        (DWT->CTRL & DWT_CTRL_CYCCNTENA_Msk) == 0u)
+        DWT_EnableCounter();
+}
+
 /**
  * @brief 私有函数,用于检查DWT CYCCNT寄存器是否溢出,并更新CYCCNT_RountCount
  * @attention 此函数假设两次调用之间的时间间隔不超过一次溢出
@@ -43,7 +64,7 @@ static void DWT_CNT_Update(void)
 void DWT_Init(uint32_t CPU_Freq_mHz)
 {
     /* 使能DWT外设 */
-    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT_EnableCounter();
 
     /* DWT CYCCNT寄存器计数清0 */
     DWT->CYCCNT = (uint32_t)0u;
@@ -61,6 +82,7 @@ void DWT_Init(uint32_t CPU_Freq_mHz)
 
 float DWT_GetDeltaT(uint32_t *cnt_last)
 {
+    DWT_EnsureCounter();
     volatile uint32_t cnt_now = DWT->CYCCNT;
     float dt = ((uint32_t)(cnt_now - *cnt_last)) / ((float)(CPU_FREQ_Hz));
     *cnt_last = cnt_now;
@@ -72,6 +94,7 @@ float DWT_GetDeltaT(uint32_t *cnt_last)
 
 double DWT_GetDeltaT64(uint32_t *cnt_last)
 {
+    DWT_EnsureCounter();
     volatile uint32_t cnt_now = DWT->CYCCNT;
     double dt = ((uint32_t)(cnt_now - *cnt_last)) / ((double)(CPU_FREQ_Hz));
     *cnt_last = cnt_now;
@@ -83,6 +106,7 @@ double DWT_GetDeltaT64(uint32_t *cnt_last)
 
 void DWT_SysTimeUpdate(void)
 {
+    DWT_EnsureCounter();
     volatile uint32_t cnt_now = DWT->CYCCNT;
     static uint64_t CNT_TEMP1, CNT_TEMP2, CNT_TEMP3;
 
@@ -126,6 +150,7 @@ uint64_t DWT_GetTimeline_us(void)
 
 void DWT_Delay(float Delay)
 {
+    DWT_EnsureCounter();
     uint32_t tickstart = DWT->CYCCNT;
     float wait = Delay;
 

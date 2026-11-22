@@ -26,9 +26,18 @@ from sensor_msgs.msg import Imu, LaserScan, PointCloud2
 from tf2_ros import Buffer, TransformListener
 
 
-EXPECTED_TOPICS = (
+SINGLE_LIDAR_TOPICS = (
     ('/livox/lidar', CustomMsg, 'MID-360 point cloud'),
     ('/livox/imu', Imu, 'MID-360 IMU'),
+)
+DUAL_LIDAR_TOPICS = (
+    ('/livox/imu_192_168_1_182', Imu, 'Primary MID-360 IMU'),
+    ('/livox/imu_192_168_1_3', Imu, 'Secondary MID-360 IMU'),
+    ('/lidar/points_fused', PointCloud2, 'Fused MID-360 point cloud'),
+    ('/lidar/points_primary', PointCloud2, 'Primary Nav2 obstacle observations'),
+    ('/lidar/points_secondary', PointCloud2, 'Secondary Nav2 obstacle observations'),
+)
+COMMON_TOPICS = (
     ('/Odometry', Odometry, 'FAST-LIO body odometry'),
     ('/cloud_registered_body', PointCloud2,
      'FAST-LIO motion-compensated body cloud'),
@@ -56,14 +65,18 @@ class NavigationHealthCheck(Node):
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
         )
-        for topic, msg_type, _ in EXPECTED_TOPICS:
+        for topic, msg_type, _ in SINGLE_LIDAR_TOPICS + DUAL_LIDAR_TOPICS + COMMON_TOPICS:
             qos = map_qos if topic == '/map' else qos_profile_sensor_data
             self.create_subscription(
                 msg_type,
                 topic,
-                lambda _msg, name=topic: self.received.add(name),
+                lambda msg, name=topic: self.observe(name, msg),
                 qos,
             )
+
+    def observe(self, topic, message):
+        if topic != '/lidar/points_fused' or message.width * message.height > 0:
+            self.received.add(topic)
 
     def transform_ready(self, parent, child):
         return self.tf_buffer.can_transform(
@@ -78,24 +91,29 @@ graph_topics = set()
 while time.monotonic() < deadline:
     rclpy.spin_once(node, timeout_sec=0.1)
     graph_topics = {name for name, _types in node.get_topic_names_and_types()}
-    topics_ready = all(topic in node.received for topic, _, _ in EXPECTED_TOPICS)
+    dual = any(node.count_publishers(topic) for topic in (
+        '/lidar/points_fused', '/livox/imu_192_168_1_182', '/livox/imu_192_168_1_3'))
+    expected_topics = COMMON_TOPICS + (DUAL_LIDAR_TOPICS if dual else SINGLE_LIDAR_TOPICS)
+    expected_transforms = EXPECTED_TRANSFORMS + (
+        (('base_link', 'livox_secondary_frame'),) if dual else ())
+    topics_ready = all(topic in node.received for topic, _, _ in expected_topics)
     transforms_ready = all(
         node.transform_ready(parent, child)
-        for parent, child in EXPECTED_TRANSFORMS
+        for parent, child in expected_transforms
     )
     action_ready = '/navigate_to_pose/_action/status' in graph_topics
     if topics_ready and transforms_ready and action_ready:
         break
 
 failed = False
-for topic, _msg_type, label in EXPECTED_TOPICS:
+for topic, _msg_type, label in expected_topics:
     if topic in node.received:
         print(f'[OK]   {label} ({topic})')
     else:
         print(f'[FAIL] {label} ({topic})')
         failed = True
 
-for parent, child in EXPECTED_TRANSFORMS:
+for parent, child in expected_transforms:
     if node.transform_ready(parent, child):
         print(f'[OK]   TF {parent} -> {child}')
     else:
